@@ -135,6 +135,8 @@ async def main() -> None:
         api_key=settings.gemini_api_key,
         text_model=settings.gemini_model,
         image_model=settings.gemini_image_model,
+        enable_google_search=settings.gemini_enable_google_search,
+        enable_code_execution=settings.gemini_enable_code_execution,
     )
     llm_client = model_factory.get_text_client()
     image_client = model_factory.get_image_client()

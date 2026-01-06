@@ -145,6 +145,7 @@ Guidance:
 - If an image is attached, and the user asks to change or analyze it, choose IMAGE_EDIT.
 - If the user wants a new image from a description, choose IMAGE_GEN.
 - If the user wants to take an action on the computer (including setting wallpaper), choose COMPUTER_USE.
+- If the user asks for time-sensitive factual info (exchange rates, news, weather), choose CHAT. The assistant can use built-in Google Search tools, so do not use COMPUTER_USE just to browse.
 - If the user refers to "this/that" and context has a last_image, assume the reference is the last image.
 
 Context JSON:

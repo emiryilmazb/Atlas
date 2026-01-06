@@ -72,12 +72,17 @@ def _vision_locate(prompt: str, llm_client: Any) -> tuple[int, int] | None:
         else:
             return None
 
+        config = None
+        build_config = getattr(llm_client, "build_generate_config", None)
+        if callable(build_config):
+            config = build_config()
         response = client.models.generate_content(
             model=llm_client._model,
             contents=[
                 prompt,
                 types.Part.from_bytes(data=image_data, mime_type="image/png"),
             ],
+            config=config,
         )
 
         import json

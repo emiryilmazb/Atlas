@@ -102,6 +102,7 @@ _STREAM_RETRY_MAX_DELAY = 3.0
 _SUGGESTION_RETRY_ATTEMPTS = 3
 _SUGGESTION_RETRY_BASE_DELAY = 0.4
 _SUGGESTION_RETRY_MAX_DELAY = 2.0
+_MAX_SOURCE_COUNT = 5
 
 _ANALYSIS_CLASSIFIER_PROMPT = """
 You classify the user's request about an image.
@@ -597,17 +598,29 @@ async def _handle_chat(
                 )
                 handler = None
                 result = None
+                sources = []
                 for attempt in range(1, _STREAM_RETRY_ATTEMPTS + 1):
                     handler = AsyncStreamHandler(
                         manager,
                         show_thoughts=show_thoughts,
                         response_label="",
                     )
-                    result = await handler.stream(
-                        llm_client,
-                        prompt,
-                        include_thoughts=show_thoughts,
-                    )
+                    if hasattr(llm_client, "stream_text_with_sources"):
+                        stream_state = await llm_client.stream_text_with_sources(
+                            prompt,
+                            include_thoughts=show_thoughts,
+                        )
+                        result = await handler.stream_chunks(
+                            stream_state.chunks,
+                            recovery=lambda: handler._attempt_recovery(llm_client, prompt),
+                        )
+                        sources = stream_state.get_sources()
+                    else:
+                        result = await handler.stream(
+                            llm_client,
+                            prompt,
+                            include_thoughts=show_thoughts,
+                        )
                     if result.error is None:
                         break
                     if attempt < _STREAM_RETRY_ATTEMPTS:
@@ -616,6 +629,10 @@ async def _handle_chat(
                 if handler is None or result is None:
                     raise RuntimeError("Streaming did not produce a result.")
                 response_text = result.response_text.strip()
+                sources_text = _format_sources_text(sources)
+                display_text = response_text
+                if sources_text:
+                    display_text = f"{response_text}\n\n{sources_text}"
                 if response_text and result.completed and db and user_id:
                     _safe_add_message(
                         db,
@@ -635,16 +652,19 @@ async def _handle_chat(
                     )
                     reply_markup = await _build_suggestion_markup(llm_client, suggestion_context)
                     response_limit = 3000 if not handler.thought_text else 2200
-                    if len(response_text) > response_limit:
+                    if len(display_text) > response_limit:
                         await manager.finalize("Response sent below.")
                         await _send_text_in_chunks(
                             message,
-                            response_text,
+                            display_text,
                             chunk_size=_TELEGRAM_TEXT_CHUNK,
                             reply_markup=reply_markup,
                         )
                     else:
-                        await manager.finalize(handler.format_message(), reply_markup=reply_markup)
+                        final_message = handler.format_message()
+                        if sources_text:
+                            final_message = f"{final_message}\n\n{_format_telegram_html(sources_text)}"
+                        await manager.finalize(final_message, reply_markup=reply_markup)
                 else:
                     await manager.finalize(handler.format_message())
                 if not response_text and not handler.thought_text:
@@ -656,8 +676,15 @@ async def _handle_chat(
         telegram_app.create_task(_stream_runner())
         return
 
+    sources = []
     try:
-        response_text = await asyncio.to_thread(llm_client.generate_text, prompt)
+        if hasattr(llm_client, "generate_text_with_sources"):
+            response_text, sources = await asyncio.to_thread(
+                llm_client.generate_text_with_sources,
+                prompt,
+            )
+        else:
+            response_text = await asyncio.to_thread(llm_client.generate_text, prompt)
     except Exception as exc:  # pragma: no cover - network/proxy errors
         logger.error("Chat response failed: %s", exc)
         await message.reply_text("Chat response failed. Please try again.")
@@ -665,6 +692,10 @@ async def _handle_chat(
     if not response_text:
         await message.reply_text("No response generated.")
         return
+    sources_text = _format_sources_text(sources)
+    display_text = response_text
+    if sources_text:
+        display_text = f"{response_text}\n\n{sources_text}"
     if db and user_id:
         _safe_add_message(
             db,
@@ -684,7 +715,7 @@ async def _handle_chat(
     )
     await _reply_with_suggestions(
         message,
-        response_text,
+        display_text,
         llm_client,
         history_text=suggestion_context,
     )
@@ -1462,6 +1493,31 @@ def _format_recent_history(db, user_id: str | None, limit: int) -> str:
     lines = [_format_history_line(entry) for entry in reversed(history)]
     history_block = "\n".join(line for line in lines if line)
     return history_block.strip()
+
+
+def _format_sources_text(sources) -> str:
+    if not sources:
+        return ""
+    cleaned: list[tuple[str, str]] = []
+    seen = set()
+    for source in sources:
+        uri = str(getattr(source, "uri", "") or "").strip()
+        if not uri or uri in seen:
+            continue
+        title = str(getattr(source, "title", "") or "").strip() or uri
+        cleaned.append((title, uri))
+        seen.add(uri)
+        if len(cleaned) >= _MAX_SOURCE_COUNT:
+            break
+    if not cleaned:
+        return ""
+    lines = ["Sources:"]
+    for title, uri in cleaned:
+        if title == uri:
+            lines.append(f"- {uri}")
+        else:
+            lines.append(f"- {title} ({uri})")
+    return "\n".join(lines)
 
 
 def _truncate_callback_data(value: str, max_bytes: int = 64) -> str:

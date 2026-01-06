@@ -42,6 +42,8 @@ class LLMClient:
 class GeminiConfig:
     api_key: str
     model: str
+    enable_google_search: bool = False
+    enable_code_execution: bool = False
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,93 @@ class ImageStreamState:
     get_image_bytes: Callable[[], bytes | None]
 
 
+@dataclass(frozen=True)
+class SourceAttribution:
+    title: str
+    uri: str
+
+
+@dataclass(frozen=True)
+class TextStreamState:
+    chunks: AsyncIterator[StreamChunk]
+    get_sources: Callable[[], list[SourceAttribution]]
+
+
+def _build_tool_list(*, enable_google_search: bool, enable_code_execution: bool):
+    if not enable_google_search and not enable_code_execution:
+        return []
+    from google.genai import types
+
+    tools: list[types.Tool] = []
+    if enable_google_search:
+        tools.append(types.Tool(google_search=types.GoogleSearch()))
+    if enable_code_execution:
+        tools.append(types.Tool(code_execution=types.ToolCodeExecution()))
+    return tools
+
+
+def _build_generate_content_config(
+    *,
+    enable_google_search: bool,
+    enable_code_execution: bool,
+    include_thoughts: bool = False,
+    response_modalities=None,
+):
+    from google.genai import types
+
+    tools = _build_tool_list(
+        enable_google_search=enable_google_search,
+        enable_code_execution=enable_code_execution,
+    )
+    if not tools and not include_thoughts and response_modalities is None:
+        return None
+    config = types.GenerateContentConfig()
+    if tools:
+        config.tools = tools
+    if include_thoughts:
+        config.thinking_config = types.ThinkingConfig(include_thoughts=True)
+    if response_modalities is not None:
+        config.response_modalities = list(response_modalities)
+    return config
+
+
+def _collect_sources_from_response(response) -> list[SourceAttribution]:
+    sources: list[SourceAttribution] = []
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        citation_meta = getattr(candidate, "citation_metadata", None)
+        citations = getattr(citation_meta, "citations", None) or []
+        for citation in citations:
+            uri = getattr(citation, "uri", None)
+            if not uri:
+                continue
+            title = getattr(citation, "title", None) or uri
+            sources.append(SourceAttribution(title=str(title), uri=str(uri)))
+        grounding = getattr(candidate, "grounding_metadata", None)
+        chunks = getattr(grounding, "grounding_chunks", None) or []
+        for chunk in chunks:
+            web = getattr(chunk, "web", None)
+            if not web:
+                continue
+            uri = getattr(web, "uri", None)
+            if not uri:
+                continue
+            title = getattr(web, "title", None) or getattr(web, "domain", None) or uri
+            sources.append(SourceAttribution(title=str(title), uri=str(uri)))
+    return sources
+
+
+def _merge_sources(
+    target: dict[str, SourceAttribution],
+    new_sources: list[SourceAttribution],
+) -> None:
+    for source in new_sources:
+        uri = source.uri.strip()
+        if not uri or uri in target:
+            continue
+        target[uri] = source
+
+
 class GeminiClient(LLMClient):
     def __init__(self, config: GeminiConfig) -> None:
         try:
@@ -71,24 +160,46 @@ class GeminiClient(LLMClient):
 
         self._client = genai.Client(api_key=config.api_key)
         self._model = config.model
+        self._enable_google_search = config.enable_google_search
+        self._enable_code_execution = config.enable_code_execution
+
+    def build_generate_config(self, include_thoughts: bool = False, response_modalities=None):
+        return _build_generate_content_config(
+            enable_google_search=self._enable_google_search,
+            enable_code_execution=self._enable_code_execution,
+            include_thoughts=include_thoughts,
+            response_modalities=response_modalities,
+        )
 
     def generate_text(self, prompt: str) -> str:
+        config = self.build_generate_config()
         response = self._client.models.generate_content(
-            model=self._model, contents=prompt)
+            model=self._model,
+            contents=prompt,
+            config=config,
+        )
         if getattr(response, "text", None):
             return response.text
         return ""
 
+    def generate_text_with_sources(self, prompt: str) -> tuple[str, list[SourceAttribution]]:
+        if not prompt:
+            return "", []
+        config = self.build_generate_config()
+        response = self._client.models.generate_content(
+            model=self._model,
+            contents=prompt,
+            config=config,
+        )
+        text = getattr(response, "text", None) or ""
+        sources: dict[str, SourceAttribution] = {}
+        _merge_sources(sources, _collect_sources_from_response(response))
+        return text, list(sources.values())
+
     async def stream_text(self, prompt: str, include_thoughts: bool = False) -> AsyncIterator[StreamChunk]:
         if not prompt:
             return
-        from google.genai import types
-
-        config = None
-        if include_thoughts:
-            config = types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(include_thoughts=True),
-            )
+        config = self.build_generate_config(include_thoughts=include_thoughts)
         stream = await self._client.aio.models.generate_content_stream(
             model=self._model,
             contents=prompt,
@@ -106,6 +217,21 @@ class GeminiClient(LLMClient):
             if isinstance(text, str) and text:
                 yield StreamChunk(text=text, is_thought=False)
 
+    async def stream_text_with_sources(
+        self,
+        prompt: str,
+        include_thoughts: bool = False,
+    ) -> TextStreamState:
+        if not prompt:
+            return TextStreamState(chunks=_empty_stream(), get_sources=lambda: [])
+        config = self.build_generate_config(include_thoughts=include_thoughts)
+        stream = await self._client.aio.models.generate_content_stream(
+            model=self._model,
+            contents=prompt,
+            config=config,
+        )
+        return _build_text_stream_state(stream)
+
     async def stream_with_image(
         self,
         prompt: str,
@@ -120,11 +246,7 @@ class GeminiClient(LLMClient):
         with open(image_path, "rb") as handle:
             image_data = handle.read()
         resolved_mime = mime_type or mimetypes.guess_type(image_path)[0] or "image/png"
-        config = None
-        if include_thoughts:
-            config = types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(include_thoughts=True),
-            )
+        config = self.build_generate_config(include_thoughts=include_thoughts)
         stream = await self._client.aio.models.generate_content_stream(
             model=self._model,
             contents=[
@@ -177,9 +299,11 @@ class GeminiClient(LLMClient):
                 mime_type=file_obj.mime_type or normalized_mime,
             )
             try:
+                config = self.build_generate_config()
                 response = self._client.models.generate_content(
                     model=self._model,
                     contents=[prompt, part],
+                    config=config,
                 )
             finally:
                 _safe_delete_file(self._client, file_obj)
@@ -497,6 +621,15 @@ class GeminiImageClient:
 
         self._client = genai.Client(api_key=config.api_key)
         self._model = config.model
+        self._enable_google_search = config.enable_google_search
+
+    def build_generate_config(self, include_thoughts: bool = False, response_modalities=None):
+        return _build_generate_content_config(
+            enable_google_search=self._enable_google_search,
+            enable_code_execution=False,
+            include_thoughts=include_thoughts,
+            response_modalities=response_modalities,
+        )
 
     def generate_image(self, prompt: str) -> bytes | None:
         if not prompt:
@@ -545,12 +678,14 @@ class GeminiImageClient:
         with open(image_path, "rb") as handle:
             image_data = handle.read()
         mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
+        config = self.build_generate_config()
         response = self._client.models.generate_content(
             model=self._model,
             contents=[
                 prompt,
                 types.Part.from_bytes(data=image_data, mime_type=mime_type),
             ],
+            config=config,
         )
         if getattr(response, "text", None):
             return response.text
@@ -564,11 +699,10 @@ class GeminiImageClient:
         modalities = [types.Modality.IMAGE]
         if include_thoughts:
             modalities.append(types.Modality.TEXT)
-        config = types.GenerateContentConfig(
+        config = self.build_generate_config(
+            include_thoughts=include_thoughts,
             response_modalities=modalities,
         )
-        if include_thoughts:
-            config.thinking_config = types.ThinkingConfig(include_thoughts=True)
         stream = await self._client.aio.models.generate_content_stream(
             model=self._model,
             contents=prompt,
@@ -592,11 +726,10 @@ class GeminiImageClient:
         modalities = [types.Modality.IMAGE]
         if include_thoughts:
             modalities.append(types.Modality.TEXT)
-        config = types.GenerateContentConfig(
+        config = self.build_generate_config(
+            include_thoughts=include_thoughts,
             response_modalities=modalities,
         )
-        if include_thoughts:
-            config.thinking_config = types.ThinkingConfig(include_thoughts=True)
         stream = await self._client.aio.models.generate_content_stream(
             model=self._model,
             contents=[
@@ -610,12 +743,13 @@ class GeminiImageClient:
     def _generate_image_via_content(self, prompt: str) -> bytes | None:
         from google.genai import types
 
+        config = self.build_generate_config(
+            response_modalities=[types.Modality.IMAGE],
+        )
         response = self._client.models.generate_content(
             model=self._model,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                response_modalities=[types.Modality.IMAGE],
-            ),
+            config=config,
         )
         return _extract_image_bytes(response)
 
@@ -625,15 +759,16 @@ class GeminiImageClient:
         with open(image_path, "rb") as handle:
             image_data = handle.read()
         mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
+        config = self.build_generate_config(
+            response_modalities=[types.Modality.IMAGE],
+        )
         response = self._client.models.generate_content(
             model=self._model,
             contents=[
                 prompt,
                 types.Part.from_bytes(data=image_data, mime_type=mime_type),
             ],
-            config=types.GenerateContentConfig(
-                response_modalities=[types.Modality.IMAGE],
-            ),
+            config=config,
         )
         return _extract_image_bytes(response)
 
@@ -667,6 +802,26 @@ async def _empty_stream() -> AsyncIterator[StreamChunk]:
         yield StreamChunk(text="", is_thought=False)
 
 
+def _build_text_stream_state(stream) -> TextStreamState:
+    sources: dict[str, SourceAttribution] = {}
+
+    async def _iter() -> AsyncIterator[StreamChunk]:
+        async for chunk in stream:
+            _merge_sources(sources, _collect_sources_from_response(chunk))
+            parts = getattr(chunk, "parts", None) or []
+            if parts:
+                for part in parts:
+                    text = getattr(part, "text", None)
+                    if isinstance(text, str) and text:
+                        yield StreamChunk(text=text, is_thought=bool(getattr(part, "thought", False)))
+                continue
+            text = getattr(chunk, "text", None)
+            if isinstance(text, str) and text:
+                yield StreamChunk(text=text, is_thought=False)
+
+    return TextStreamState(chunks=_iter(), get_sources=lambda: list(sources.values()))
+
+
 def _build_image_stream_state(stream) -> ImageStreamState:
     image_bytes: bytes | None = None
 
@@ -690,21 +845,46 @@ def _build_image_stream_state(stream) -> ImageStreamState:
     return ImageStreamState(chunks=_iter(), get_image_bytes=lambda: image_bytes)
 
 
-def build_llm_client(api_key: str, model: str) -> Optional[LLMClient]:
+def build_llm_client(
+    api_key: str,
+    model: str,
+    *,
+    enable_google_search: bool = False,
+    enable_code_execution: bool = False,
+) -> Optional[LLMClient]:
     if not api_key:
         return None
     try:
-        return GeminiClient(GeminiConfig(api_key=api_key, model=model))
+        return GeminiClient(
+            GeminiConfig(
+                api_key=api_key,
+                model=model,
+                enable_google_search=enable_google_search,
+                enable_code_execution=enable_code_execution,
+            )
+        )
     except LLMClientError as exc:
         logger.error("LLM client unavailable: %s", exc)
         return None
 
 
-def build_image_client(api_key: str, model: str) -> Optional[GeminiImageClient]:
+def build_image_client(
+    api_key: str,
+    model: str,
+    *,
+    enable_google_search: bool = False,
+) -> Optional[GeminiImageClient]:
     if not api_key:
         return None
     try:
-        return GeminiImageClient(GeminiConfig(api_key=api_key, model=model))
+        return GeminiImageClient(
+            GeminiConfig(
+                api_key=api_key,
+                model=model,
+                enable_google_search=enable_google_search,
+                enable_code_execution=False,
+            )
+        )
     except LLMClientError as exc:
         logger.error("Image client unavailable: %s", exc)
         return None
