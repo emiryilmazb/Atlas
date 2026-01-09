@@ -12,6 +12,7 @@ from app.config import get_settings
 from .handlers import (
     handle_button,
     handle_document_message,
+    handle_media_message,
     handle_pc_command,
     handle_photo_message,
     handle_text_message,
@@ -44,6 +45,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("pc", handle_pc_command))
     application.add_handler(CallbackQueryHandler(handle_button))
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo_message))
+    application.add_handler(
+        MessageHandler(filters.AUDIO | filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE, handle_media_message)
+    )
     application.add_handler(
         MessageHandler(filters.Document.ALL & ~filters.Document.IMAGE, handle_document_message)
     )

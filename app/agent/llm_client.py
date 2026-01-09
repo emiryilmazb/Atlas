@@ -277,6 +277,15 @@ class GeminiClient(LLMClient):
         from google.genai import types
 
         normalized_mime = mime_type or mimetypes.guess_type(file_path)[0]
+        if _is_gemini_flash_model(self._model):
+            size_error = _flash_document_size_error(file_path, normalized_mime)
+            if size_error:
+                return FileGenerationResult("", size_error)
+            if not _is_supported_flash_file_type(file_path, normalized_mime):
+                return FileGenerationResult(
+                    "",
+                    self._build_unsupported_file_message(prompt, file_path, normalized_mime),
+                )
         if _should_inline_text(file_path, normalized_mime):
             text_payload = _extract_text_fallback(file_path, normalized_mime)
             if not text_payload:
@@ -323,6 +332,32 @@ class GeminiClient(LLMClient):
                 return FileGenerationResult("", _unreadable_file_message(file_path, normalized_mime))
             logger.warning("File upload failed: %s", exc)
             return FileGenerationResult("", "Sorry, I couldn't process this document right now.")
+
+    def _build_unsupported_file_message(
+        self,
+        user_prompt: str,
+        file_path: str,
+        mime_type: str | None,
+    ) -> str:
+        label = mime_type or Path(file_path).suffix.lower() or "unknown"
+        fallback = _unsupported_file_type_message(label)
+        if not user_prompt:
+            return fallback
+        prompt = (
+            "The user tried to upload a file that Gemini cannot process.\n"
+            f"User request: {user_prompt}\n"
+            f"File type: {label}\n"
+            "Reply in the user's language with a short, friendly message that this file type is not supported. "
+            "If it is a document, suggest PDF or plain text (or exporting to PDF). "
+            "If it is audio/video, suggest a common supported format (e.g., mp3, wav, mp4, webm)."
+        )
+        try:
+            response = self.generate_text(prompt)
+        except Exception as exc:
+            logger.warning("Unsupported file message generation failed: %s", exc)
+            return fallback
+        cleaned = response.strip()
+        return cleaned or fallback
 
     def generate_suggestions(self, history_text: str) -> list[str]:
         prompt = (
@@ -552,6 +587,13 @@ def _unreadable_file_message(file_path: str, mime_type: str | None) -> str:
     )
 
 
+def _unsupported_file_type_message(label: str) -> str:
+    return (
+        f"Sorry, Gemini doesn't support this file type ({label}). "
+        "Please try PDF or plain text, or export the document to PDF."
+    )
+
+
 _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -569,14 +611,114 @@ _TEXT_EXTENSIONS = {
     ".yml",
     ".log",
 }
-_INLINE_ONLY_EXTENSIONS = {".docx", ".pptx", ".xlsx", ".odt", ".rtf", ".doc"}
+_INLINE_ONLY_EXTENSIONS = {".docx", ".pptx", ".xlsx", ".odt", ".rtf"}
 _INLINE_ONLY_MIME_TYPES = {
     _DOCX_MIME,
     _PPTX_MIME,
     _XLSX_MIME,
     _ODT_MIME,
-    _DOC_MIME,
 }
+
+_MB = 1024 * 1024
+
+GEMINI_FLASH_MAX_DOCUMENT_BYTES = 50 * _MB
+GEMINI_FLASH_MAX_INLINE_IMAGE_BYTES = 7 * _MB
+GEMINI_IMAGE_PREVIEW_MAX_INLINE_IMAGE_BYTES = 7 * _MB
+
+GEMINI_IMAGE_MIME_TYPES = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/heic",
+        "image/heif",
+    }
+)
+GEMINI_FLASH_DOCUMENT_MIME_TYPES = frozenset(
+    {
+        "application/pdf",
+        "text/plain",
+    }
+)
+GEMINI_FLASH_VIDEO_MIME_TYPES = frozenset(
+    {
+        "video/x-flv",
+        "video/quicktime",
+        "video/mpeg",
+        "video/mpegs",
+        "video/mpg",
+        "video/mp4",
+        "video/webm",
+        "video/wmv",
+        "video/3gpp",
+    }
+)
+GEMINI_FLASH_AUDIO_MIME_TYPES = frozenset(
+    {
+        "audio/x-aac",
+        "audio/flac",
+        "audio/mp3",
+        "audio/m4a",
+        "audio/mpeg",
+        "audio/mpga",
+        "audio/mp4",
+        "audio/ogg",
+        "audio/pcm",
+        "audio/wav",
+        "audio/webm",
+    }
+)
+
+
+def _is_gemini_flash_model(model: str) -> bool:
+    return model.startswith("gemini-3-flash")
+
+
+def _file_size_bytes(file_path: str) -> int | None:
+    try:
+        return Path(file_path).stat().st_size
+    except Exception as exc:
+        logger.warning("File size check failed: %s", exc)
+        return None
+
+
+def _format_limit_mb(limit_bytes: int) -> str:
+    return f"{int(limit_bytes / _MB)} MB"
+
+
+def _file_too_large_message(file_kind: str, max_bytes: int) -> str:
+    return f"{file_kind} file is too large for Gemini. Max size is {_format_limit_mb(max_bytes)}."
+
+
+def _should_enforce_flash_document_limit(file_path: str, mime_type: str | None) -> bool:
+    if _should_inline_text(file_path, mime_type):
+        return True
+    return mime_type in GEMINI_FLASH_DOCUMENT_MIME_TYPES
+
+
+def _flash_document_size_error(file_path: str, mime_type: str | None) -> str | None:
+    if not _should_enforce_flash_document_limit(file_path, mime_type):
+        return None
+    size_bytes = _file_size_bytes(file_path)
+    if size_bytes is None:
+        return None
+    if size_bytes > GEMINI_FLASH_MAX_DOCUMENT_BYTES:
+        return _file_too_large_message("Document", GEMINI_FLASH_MAX_DOCUMENT_BYTES)
+    return None
+
+
+def _is_supported_flash_file_type(file_path: str, mime_type: str | None) -> bool:
+    if _should_inline_text(file_path, mime_type):
+        return True
+    if not mime_type:
+        return False
+    if mime_type in GEMINI_FLASH_DOCUMENT_MIME_TYPES:
+        return True
+    if mime_type in GEMINI_FLASH_VIDEO_MIME_TYPES:
+        return True
+    if mime_type in GEMINI_FLASH_AUDIO_MIME_TYPES:
+        return True
+    return False
 
 
 def _wait_for_file_active(client, file_obj, timeout_seconds: int = 30, poll_interval: float = 0.8):

@@ -228,14 +228,15 @@ class AsyncStreamHandler:
         if not chunk.is_thought:
             self._response_text += chunk.text
 
-    def format_message(self) -> str:
+    def format_message(self, *, include_thoughts: bool | None = None) -> str:
+        show_thoughts = self._show_thoughts if include_thoughts is None else include_thoughts
         thought_text = self._trim_text(self._thought_text, max_chars=1100)
         response_text = self._trim_text(
             self._response_text,
-            max_chars=3000 if not thought_text else 2200,
+            max_chars=3000 if (not thought_text or not show_thoughts) else 2200,
         )
         blocks: list[str] = []
-        if self._show_thoughts and thought_text:
+        if show_thoughts and thought_text:
             blocks.append(f"{self._thought_label}\n<pre>{_escape_html(thought_text)}</pre>")
         if response_text:
             if self._response_as_code:

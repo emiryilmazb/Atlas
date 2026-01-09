@@ -142,6 +142,16 @@ def record_task_completion(
         _save_sessions()
 
 
+def record_handoff_detail(user_id: str | None, key: str, value: Any) -> None:
+    if not user_id or not key or value is None:
+        return
+    with _LOCK:
+        session = _get_or_create_session(user_id)
+        session.pending_details[str(key)] = value
+        _SESSIONS[user_id] = session
+        _save_sessions()
+
+
 def record_image_result(
     user_id: str | None,
     image_path: str,

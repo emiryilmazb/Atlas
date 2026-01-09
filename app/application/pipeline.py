@@ -68,6 +68,10 @@ async def run_session(
     for _ in range(len(session.steps)):
         if session.status != SessionStatus.RUNNING:
             break
+        if agent_context.stop_requested:
+            session.pause()
+            session.log_event(f"Paused due to STOP request: {agent_context.stop_reason}")
+            return PipelineResult(session=session, status=session.status)
         step = session.current_step()
         if step is None:
             break

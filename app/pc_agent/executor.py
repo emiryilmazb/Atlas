@@ -36,11 +36,144 @@ class ExecutionError(RuntimeError):
     pass
 
 
+COMMON_APP_SHORTCUTS: dict[str, list[dict[str, Any]]] = {
+    "spotify": [
+        {"keys": ["space"], "keywords": ("play", "pause", "resume", "toggle")},
+        {"keys": ["ctrl", "right"], "keywords": ("next", "skip", "forward")},
+        {"keys": ["ctrl", "left"], "keywords": ("previous", "back")},
+        {"keys": ["ctrl", "l"], "keywords": ("search", "find")},
+    ],
+    "browser": [
+        {"keys": ["ctrl", "l"], "keywords": ("address", "search", "url", "find")},
+        {"keys": ["ctrl", "t"], "keywords": ("new tab", "open tab")},
+        {"keys": ["ctrl", "w"], "keywords": ("close tab", "close this tab")},
+        {"keys": ["ctrl", "r"], "keywords": ("refresh", "reload")},
+        {"keys": ["alt", "left"], "keywords": ("back", "previous page")},
+        {"keys": ["alt", "right"], "keywords": ("forward", "next page")},
+    ],
+    "whatsapp": [
+        {"keys": ["ctrl", "f"], "keywords": ("search", "find")},
+    ],
+}
+COMMON_APP_SHORTCUTS["*"] = [
+    {"keys": ["ctrl", "f"], "keywords": ("find", "search")},
+    {"keys": ["ctrl", "l"], "keywords": ("address", "url")},
+]
+
+MENU_PATH_SEPARATORS = (">", "->", "\u00bb")
+URL_PATTERN = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
+
+
 @dataclass
 class PCSession:
     playwright: object
     browser: object
     page: object
+
+
+class WebBrowserProvider:
+    def __init__(self, agent_context: AgentContext) -> None:
+        self._agent_context = agent_context
+
+    def navigate(self, url: str) -> None:
+        session = _ensure_browser(self._agent_context)
+        session.page.goto(str(url), wait_until="domcontentloaded")
+
+    def click_text(self, text: str, timeout_seconds: float) -> bool:
+        session = _ensure_browser(self._agent_context)
+        remaining = max(0.5, timeout_seconds)
+        try:
+            session.page.get_by_text(text).first.click(timeout=int(remaining * 1000))
+            return True
+        except Exception:
+            pass
+        try:
+            session.page.get_by_role("button", name=text).first.click(timeout=int(remaining * 1000))
+            return True
+        except Exception:
+            pass
+        try:
+            selector = f"input[type=submit][value=\"{text}\"]"
+            session.page.locator(selector).first.click(timeout=int(remaining * 1000))
+            return True
+        except Exception:
+            return False
+
+    def type_text(self, value: str, selector: str | None = None, label: str | None = None) -> bool:
+        if not selector and not label:
+            return False
+        session = _ensure_browser(self._agent_context)
+        try:
+            if selector:
+                session.page.locator(selector).first.fill(value)
+            else:
+                session.page.get_by_label(label).first.fill(value)
+            return True
+        except Exception:
+            return False
+
+    def fill_form(self, fields: list[dict[str, Any]]) -> None:
+        session = _ensure_browser(self._agent_context)
+        for field in fields:
+            label = field.get("label")
+            value = field.get("value")
+            if label is None or value is None:
+                raise ExecutionError("fill_form field missing label/value")
+            session.page.get_by_label(str(label)).first.fill(str(value))
+
+    def upload_file(self, selector: str, path: str) -> None:
+        session = _ensure_browser(self._agent_context)
+        session.page.set_input_files(selector, path)
+
+    def type_search(self, value: str, press_enter: bool = True) -> bool:
+        session = _ensure_browser(self._agent_context)
+        selectors = [
+            "textarea[name='q']",
+            "input[name='q']",
+            "input[aria-label*='Search']",
+            "textarea[aria-label*='Search']",
+            "input[type='search']",
+        ]
+        for selector in selectors:
+            try:
+                locator = session.page.locator(selector).first
+                locator.fill(value)
+                if press_enter:
+                    session.page.keyboard.press("Enter")
+                return True
+            except Exception:
+                continue
+        return False
+
+
+class DesktopProvider:
+    def __init__(self, agent_context: AgentContext) -> None:
+        self._agent_context = agent_context
+
+    def click_text(
+        self,
+        text: str,
+        llm_client: Any,
+        timeout_seconds: float,
+        instruction: str | None,
+    ) -> None:
+        _click_text(
+            self._agent_context,
+            text,
+            llm_client=llm_client,
+            timeout_seconds=timeout_seconds,
+            instruction=instruction,
+            prefer_web=False,
+        )
+
+    def vision_click(self, instruction: str, llm_client: Any) -> None:
+        point = locate_ui_point(str(instruction), llm_client)
+        if not point:
+            raise ExecutionError(f"Unable to locate target via vision: {instruction}")
+        pyautogui.click(point[0], point[1])
+
+    def mouse_click(self, x: int, y: int) -> None:
+        pyautogui.click(x, y)
 
 
 def execute_action(
@@ -62,14 +195,33 @@ def execute_action(
 
 def _dispatch_action(action: PlannedAction, agent_context: AgentContext, llm_client: Any = None) -> None:
     if action.name == "open_browser":
+        if _use_system_browser(agent_context):
+            browser_name = str(action.payload.get("name") or agent_context.pc_state.get("browser_name") or "Chrome")
+            window_title = action.payload.get("window_title") or agent_context.pc_state.get(
+                "browser_window_title")
+            _open_app_from_start_menu(
+                browser_name,
+                window_title=str(window_title) if window_title else None,
+            )
+            agent_context.pc_state["active_app_hint"] = "browser"
+            agent_context.pc_state["browser_mode"] = "system"
+            return
         _ensure_browser(agent_context)
+        agent_context.pc_state["browser_mode"] = "playwright"
         return
     if action.name == "navigate":
-        url = action.payload.get("url")
+        url = _resolve_navigation_url(action.payload.get("url"), agent_context)
         if not url:
             raise ExecutionError("navigate action requires url")
-        session = _ensure_browser(agent_context)
-        session.page.goto(url, wait_until="domcontentloaded")
+        web_provider = WebBrowserProvider(agent_context)
+        if _should_use_web_provider(action, agent_context, url=url):
+            web_provider.navigate(str(url))
+            agent_context.pc_state["browser_mode"] = "playwright"
+            agent_context.pc_state["active_app_hint"] = "browser"
+            return
+        _navigate_system_browser(str(url), agent_context)
+        agent_context.pc_state["browser_mode"] = "system"
+        agent_context.pc_state["active_app_hint"] = "browser"
         return
     if action.name == "click_text":
         text = action.payload.get("text")
@@ -94,10 +246,17 @@ def _dispatch_action(action: PlannedAction, agent_context: AgentContext, llm_cli
                     return
                 raise ExecutionError(
                     "Unable to play first search result in Spotify.")
-        _click_text(
-            agent_context,
-            text,
-            llm_client,
+        if _maybe_use_shortcut(action, agent_context):
+            return
+        web_provider = WebBrowserProvider(agent_context)
+        if _should_use_web_provider(action, agent_context) and web_provider.click_text(
+            str(text),
+            timeout_seconds=timeout_seconds,
+        ):
+            return
+        DesktopProvider(agent_context).click_text(
+            str(text),
+            llm_client=llm_client,
             timeout_seconds=timeout_seconds,
             instruction=instruction,
         )
@@ -111,12 +270,9 @@ def _dispatch_action(action: PlannedAction, agent_context: AgentContext, llm_cli
         if _is_search_step(action.description, instruction) and _is_whatsapp_active_window(agent_context):
             _focus_whatsapp_search(agent_context, llm_client)
             return
-        point = locate_ui_point(str(instruction), llm_client)
-        if not point:
-            raise ExecutionError(
-                f"Unable to locate target via vision: {instruction}")
-        x, y = point
-        pyautogui.click(x, y)
+        if _maybe_use_shortcut(action, agent_context):
+            return
+        DesktopProvider(agent_context).vision_click(str(instruction), llm_client)
         return
     if action.name == "type_text":
         value = action.payload.get("value")
@@ -125,60 +281,70 @@ def _dispatch_action(action: PlannedAction, agent_context: AgentContext, llm_cli
         press_enter = action.payload.get("press_enter")
         selector = action.payload.get("selector")
         label = action.payload.get("label")
-        if selector or label:
-            session = _ensure_browser(agent_context)
-            if selector:
-                session.page.locator(selector).first.fill(value)
-            else:
-                session.page.get_by_label(label).first.fill(value)
-        else:
-            instruction = action.payload.get(
-                "instruction") or action.payload.get("target")
-            is_whatsapp = _is_whatsapp_active_window(agent_context)
-            is_search = _is_search_step(action.description, instruction)
-            is_message = _is_message_step(action.description, instruction)
-            if is_search and is_whatsapp:
-                _focus_whatsapp_search(agent_context, llm_client)
-            if instruction and llm_client and not (is_whatsapp and (is_search or is_message)):
-                point = locate_ui_point(str(instruction), llm_client)
-                if not point:
-                    raise ExecutionError(
-                        f"Unable to locate input via vision: {instruction}")
-                pyautogui.click(point[0], point[1])
+        web_provider = WebBrowserProvider(agent_context)
+        if (selector or label) and _should_use_web_provider(action, agent_context):
+            if web_provider.type_text(str(value), selector=selector, label=label):
+                return
+        if _maybe_type_web_search(action, agent_context, web_provider, str(value), press_enter):
+            return
+        instruction = action.payload.get(
+            "instruction") or action.payload.get("target")
+        if not instruction:
+            instruction = action.description or None
+        if not instruction and label:
+            instruction = f"click the input labeled '{label}'"
+        is_whatsapp = _is_whatsapp_active_window(agent_context)
+        is_search = _is_search_step(action.description, instruction)
+        is_message = _is_message_step(action.description, instruction)
+        if is_search and is_whatsapp:
+            _focus_whatsapp_search(agent_context, llm_client)
+        if instruction and llm_client and not (is_whatsapp and (is_search or is_message)):
+            point = locate_ui_point(str(instruction), llm_client)
+            if not point:
+                raise ExecutionError(
+                    f"Unable to locate input via vision: {instruction}")
+            pyautogui.click(point[0], point[1])
+            time.sleep(0.2)
+        if is_message and is_whatsapp:
+            _focus_whatsapp_window()
+            _focus_whatsapp_message_input(llm_client)
+        if agent_context.pc_state.pop("force_search_focus", False):
+            try:
+                logger.info(
+                    "Applying Ctrl+L before typing to focus search.")
+                pyautogui.hotkey("ctrl", "l")
                 time.sleep(0.2)
-            if is_message and is_whatsapp:
-                _focus_whatsapp_window()
-                _focus_whatsapp_message_input(llm_client)
-            if agent_context.pc_state.pop("force_search_focus", False):
-                try:
-                    logger.info(
-                        "Applying Ctrl+L before typing to focus search.")
-                    pyautogui.hotkey("ctrl", "l")
-                    time.sleep(0.2)
-                    agent_context.pc_state["search_context"] = True
-                except Exception:
-                    pass
-            if is_search and is_whatsapp:
-                _replace_input_text(str(value))
-            elif is_message and is_whatsapp:
-                _replace_input_text(str(value))
-            else:
-                pyautogui.typewrite(str(value), interval=0.02)
-            if is_search and is_whatsapp:
-                _click_whatsapp_search_result(
-                    str(value), agent_context, llm_client)
-            if is_message and is_whatsapp:
-                should_send = _should_press_enter_for_send(
-                    action.description, instruction)
-                if press_enter is None:
-                    press_enter = should_send
-                elif press_enter is False and should_send:
-                    press_enter = True
-                if press_enter:
-                    pyautogui.press("enter")
-            if agent_context.pc_state.pop("search_context", False):
-                agent_context.pc_state["last_typed_text"] = str(value)
-                agent_context.pc_state["pending_play_after_enter"] = True
+                agent_context.pc_state["search_context"] = True
+            except Exception:
+                pass
+        if is_search and is_whatsapp:
+            _replace_input_text(str(value))
+        elif is_message and is_whatsapp:
+            _replace_input_text(str(value))
+        else:
+            pyautogui.typewrite(str(value), interval=0.02)
+        if is_search and is_whatsapp:
+            _click_whatsapp_search_result(
+                str(value), agent_context, llm_client)
+        if is_message and is_whatsapp:
+            should_send = _should_press_enter_for_send(
+                action.description, instruction)
+            if press_enter is None:
+                press_enter = should_send
+            elif press_enter is False and should_send:
+                press_enter = True
+            if press_enter:
+                pyautogui.press("enter")
+        if not (is_whatsapp and is_message):
+            if press_enter is None and _should_press_enter_for_send(
+                action.description, instruction
+            ):
+                press_enter = True
+            if press_enter:
+                pyautogui.press("enter")
+        if agent_context.pc_state.pop("search_context", False):
+            agent_context.pc_state["last_typed_text"] = str(value)
+            agent_context.pc_state["pending_play_after_enter"] = True
         return
     if action.name == "vision_type":
         value = action.payload.get("value")
@@ -227,25 +393,68 @@ def _dispatch_action(action: PlannedAction, agent_context: AgentContext, llm_cli
         if press_enter:
             pyautogui.press("enter")
         return
+    if action.name == "scroll":
+        direction = str(action.payload.get("direction", "down")).lower()
+        amount = int(action.payload.get("amount", 600))
+        x = action.payload.get("x")
+        y = action.payload.get("y")
+        if x is not None and y is not None:
+            pyautogui.moveTo(x, y, duration=0.1)
+        if direction in {"down", "up"}:
+            delta = -amount if direction == "down" else amount
+            pyautogui.scroll(delta)
+            return
+        if direction in {"left", "right"}:
+            delta = amount if direction == "right" else -amount
+            if hasattr(pyautogui, "hscroll"):
+                pyautogui.hscroll(delta)
+                return
+            raise ExecutionError("Horizontal scrolling is not supported on this platform.")
+        raise ExecutionError(f"scroll direction not supported: {direction}")
+    if action.name == "drag":
+        start_x = action.payload.get("start_x")
+        start_y = action.payload.get("start_y")
+        end_x = action.payload.get("end_x")
+        end_y = action.payload.get("end_y")
+        from_instruction = action.payload.get("from_instruction") or action.payload.get("instruction")
+        to_instruction = action.payload.get("to_instruction") or action.payload.get("target_instruction")
+        duration = float(action.payload.get("duration", 0.4))
+        if start_x is None or start_y is None:
+            if not from_instruction or not llm_client:
+                raise ExecutionError("drag requires start coordinates or from_instruction")
+            point = locate_ui_point(str(from_instruction), llm_client)
+            if not point:
+                raise ExecutionError(
+                    f"Unable to locate drag start via vision: {from_instruction}")
+            start_x, start_y = point
+        if end_x is None or end_y is None:
+            if not to_instruction or not llm_client:
+                raise ExecutionError("drag requires end coordinates or to_instruction")
+            point = locate_ui_point(str(to_instruction), llm_client)
+            if not point:
+                raise ExecutionError(
+                    f"Unable to locate drag end via vision: {to_instruction}")
+            end_x, end_y = point
+        pyautogui.moveTo(start_x, start_y, duration=0.1)
+        pyautogui.dragTo(end_x, end_y, duration=duration)
+        return
+    if action.name == "wait":
+        seconds = float(action.payload.get("seconds", action.payload.get("duration", 1)))
+        if seconds > 0:
+            time.sleep(seconds)
+        return
     if action.name == "fill_form":
         fields = action.payload.get("fields", [])
         if not fields:
             raise ExecutionError("fill_form requires fields payload")
-        session = _ensure_browser(agent_context)
-        for field in fields:
-            label = field.get("label")
-            value = field.get("value")
-            if label is None or value is None:
-                raise ExecutionError("fill_form field missing label/value")
-            session.page.get_by_label(str(label)).first.fill(str(value))
+        WebBrowserProvider(agent_context).fill_form(fields)
         return
     if action.name == "upload_file":
         selector = action.payload.get("selector")
         path = action.payload.get("path")
         if not selector or not path:
             raise ExecutionError("upload_file requires selector and path")
-        session = _ensure_browser(agent_context)
-        session.page.set_input_files(selector, path)
+        WebBrowserProvider(agent_context).upload_file(selector, path)
         return
     if action.name == "focus_window":
         title = action.payload.get("title")
@@ -268,7 +477,9 @@ def _dispatch_action(action: PlannedAction, agent_context: AgentContext, llm_cli
         y = action.payload.get("y")
         if x is None or y is None:
             raise ExecutionError("mouse_click requires x/y")
-        pyautogui.click(x, y)
+        if _maybe_use_shortcut(action, agent_context):
+            return
+        DesktopProvider(agent_context).mouse_click(x, y)
         return
     if action.name == "keypress":
         key = action.payload.get("key")
@@ -298,6 +509,8 @@ def _dispatch_action(action: PlannedAction, agent_context: AgentContext, llm_cli
             pyautogui.hotkey(*keys)
         else:
             pyautogui.press(key_value)
+        if key_value in {"ctrl+c", "ctrl+shift+c"}:
+            _capture_handoff_from_clipboard(agent_context)
         if key_value == "enter" and agent_context.pc_state.pop("pending_play_after_enter", False):
             if not agent_context.pc_state.get("allow_auto_play_after_enter", True):
                 return
@@ -379,15 +592,282 @@ def _dispatch_action(action: PlannedAction, agent_context: AgentContext, llm_cli
     raise ExecutionError(f"Unsupported action: {action.name}")
 
 
+def _should_use_web_provider(
+    action: PlannedAction,
+    agent_context: AgentContext,
+    url: str | None = None,
+) -> bool:
+    if action.name in {"navigate", "fill_form", "upload_file"}:
+        return True
+    payload = action.payload or {}
+    if url and _looks_like_url(str(url)):
+        return True
+    if payload.get("selector") or payload.get("label"):
+        return True
+    combined = " ".join(
+        str(value)
+        for value in (
+            action.description,
+            payload.get("text"),
+            payload.get("instruction"),
+            payload.get("url"),
+        )
+        if value
+    )
+    if _contains_web_hint(combined):
+        return True
+    return agent_context.pc_state.get("active_app_hint") == "browser"
+
+
+def _resolve_navigation_url(url: str | None, agent_context: AgentContext) -> str | None:
+    candidate = str(url).strip() if url else ""
+    if candidate.lower() in {"clipboard", "last_copied_url", "last_url"}:
+        candidate = ""
+    if not candidate:
+        handoff = str(agent_context.pc_state.get("handoff_url", "") or "").strip()
+        if handoff:
+            candidate = handoff
+    if not candidate:
+        clipboard = _get_clipboard_text()
+        candidate = _extract_url_from_text(clipboard) or ""
+    if candidate:
+        agent_context.pc_state["handoff_url"] = candidate
+    return candidate or None
+
+
+def _capture_handoff_from_clipboard(agent_context: AgentContext) -> None:
+    clipboard = _get_clipboard_text()
+    if clipboard:
+        agent_context.pc_state["last_clipboard_text"] = clipboard
+    url = _extract_url_from_text(clipboard)
+    if url:
+        agent_context.pc_state["handoff_url"] = url
+
+
+def _get_clipboard_text() -> str:
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        text = root.clipboard_get()
+        root.update()
+        root.destroy()
+        return str(text)
+    except Exception:
+        return ""
+
+
+def _extract_url_from_text(text: str) -> str | None:
+    if not text:
+        return None
+    match = URL_PATTERN.search(text)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _looks_like_url(value: str) -> bool:
+    return bool(URL_PATTERN.search(value or ""))
+
+
+def _contains_web_hint(text: str) -> bool:
+    normalized = _normalize_text(text or "")
+    if "http" in normalized or "www." in normalized:
+        return True
+    return any(
+        token in normalized
+        for token in (
+            "linkedin",
+            "github",
+            "google",
+            "gmail",
+            "outlook",
+            "calendar",
+            "drive",
+            "docs",
+            "forms",
+            "browser",
+            "website",
+            "web page",
+            "url",
+        )
+    )
+
+
+def _maybe_use_shortcut(action: PlannedAction, agent_context: AgentContext) -> bool:
+    if action.name not in {"click_text", "vision_click", "mouse_click"}:
+        return False
+    if _should_skip_shortcut(action, agent_context):
+        return False
+    shortcut = _find_shortcut_for_action(action, agent_context)
+    if not shortcut:
+        return False
+    if len(shortcut) == 1:
+        pyautogui.press(shortcut[0])
+    else:
+        pyautogui.hotkey(*shortcut)
+    return True
+
+
+def _should_skip_shortcut(action: PlannedAction, agent_context: AgentContext) -> bool:
+    description = str(action.description or "")
+    payload = action.payload or {}
+    text = str(payload.get("text", "") or "")
+    instruction = str(payload.get("instruction", "") or "")
+    if _is_whatsapp_active_window(agent_context):
+        if _is_search_step(description, instruction) or _is_chat_selection_step(description, instruction):
+            return True
+    normalized = _normalize_text(f"{description} {text} {instruction}")
+    if "result" in normalized:
+        return True
+    if _is_play_first_result_request(text, normalized):
+        return True
+    return _is_song_selection_request(agent_context, text, normalized)
+
+
+def _find_shortcut_for_action(action: PlannedAction, agent_context: AgentContext) -> list[str] | None:
+    payload = action.payload or {}
+    text = str(payload.get("text", "") or "")
+    instruction = str(payload.get("instruction", "") or "")
+    description = str(action.description or "")
+    normalized = _normalize_text(f"{description} {text} {instruction}")
+    if not normalized:
+        return None
+    app_key = _resolve_app_shortcut_key(agent_context)
+    candidates = COMMON_APP_SHORTCUTS.get(app_key, []) + COMMON_APP_SHORTCUTS.get("*", [])
+    for rule in candidates:
+        if any(keyword in normalized for keyword in rule.get("keywords", ())):
+            keys = [str(key) for key in rule.get("keys", []) if key]
+            return keys or None
+    return None
+
+
+def _resolve_app_shortcut_key(agent_context: AgentContext) -> str:
+    hint = str(agent_context.pc_state.get("active_app_hint") or "").lower()
+    if hint:
+        return hint
+    if _is_spotify_active_window(agent_context):
+        return "spotify"
+    if _is_whatsapp_active_window(agent_context):
+        return "whatsapp"
+    if agent_context.pc_state.get("browser_mode") or _use_system_browser(agent_context):
+        return "browser"
+    return "*"
+
+
+def _maybe_type_web_search(
+    action: PlannedAction,
+    agent_context: AgentContext,
+    web_provider: WebBrowserProvider,
+    value: str,
+    press_enter: bool | None,
+) -> bool:
+    if not _should_use_web_provider(action, agent_context):
+        return False
+    description = str(action.description or "")
+    instruction = str(action.payload.get("instruction", "") or "")
+    if not _is_search_step(description, instruction):
+        return False
+    if press_enter is None:
+        press_enter = True
+    return web_provider.type_search(value, press_enter=bool(press_enter))
+
+
+def _should_use_web_dom(agent_context: AgentContext, prefer_web: bool | None) -> bool:
+    if prefer_web is False:
+        return False
+    if _is_spotify_active_window(agent_context) or _is_whatsapp_active_window(agent_context):
+        return False
+    hint = agent_context.pc_state.get("active_app_hint")
+    if hint and hint != "browser":
+        return False
+    if prefer_web is True:
+        return True
+    return _is_browser_active_window(agent_context) or hint == "browser"
+
+
+def _maybe_use_alt_menu_navigation(
+    text: str,
+    instruction: str | None,
+    agent_context: AgentContext,
+) -> bool:
+    if agent_context.pc_state.get("active_app_hint") == "browser":
+        return False
+    combined = f"{text} {instruction or ''}".strip()
+    tokens = _parse_menu_path(combined)
+    if not tokens:
+        return False
+    try:
+        pyautogui.press("alt")
+        time.sleep(0.1)
+        for token in tokens:
+            key = _menu_access_key(token)
+            if not key:
+                return False
+            pyautogui.press(key)
+            time.sleep(0.1)
+        return True
+    except Exception:
+        return False
+
+
+def _parse_menu_path(text: str) -> list[str]:
+    if not text:
+        return []
+    for separator in MENU_PATH_SEPARATORS:
+        if separator in text:
+            parts = [part.strip() for part in text.split(separator)]
+            return [part for part in parts if part]
+    normalized = _normalize_text(text)
+    if "menu" not in normalized:
+        return []
+    tokens = []
+    for token in ("file", "edit", "view", "insert", "format", "tools", "help"):
+        if token in normalized:
+            tokens.append(token)
+            break
+    if tokens:
+        return tokens
+    return []
+
+
+def _menu_access_key(token: str) -> str | None:
+    token = token.strip()
+    if not token:
+        return None
+    if "&" in token:
+        amp = token.index("&")
+        if amp + 1 < len(token) and token[amp + 1].isalnum():
+            return token[amp + 1].lower()
+    for char in token:
+        if char.isalnum():
+            return char.lower()
+    return None
+
+
 def _ensure_browser(agent_context: AgentContext) -> PCSession:
     session = agent_context.pc_state.get("browser_session")
     if session:
         return session
 
     playwright = sync_playwright().start()
-    browser = playwright.chromium.launch(headless=False)
-    page = browser.new_page()
-    session = PCSession(playwright=playwright, browser=browser, page=page)
+    user_data_dir = str(agent_context.pc_state.get("browser_user_data_dir") or "").strip()
+    executable_path = str(agent_context.pc_state.get(
+        "browser_executable_path") or "").strip() or None
+    if user_data_dir:
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir,
+            headless=False,
+            executable_path=executable_path,
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        session = PCSession(playwright=playwright, browser=context, page=page)
+    else:
+        browser = playwright.chromium.launch(
+            headless=False,
+            executable_path=executable_path,
+        )
+        page = browser.new_page()
+        session = PCSession(playwright=playwright, browser=browser, page=page)
     agent_context.pc_state["browser_session"] = session
     return session
 
@@ -398,17 +878,22 @@ def _click_text(
     llm_client: Any = None,
     timeout_seconds: float = 10,
     instruction: str | None = None,
+    prefer_web: bool | None = None,
 ) -> None:
     deadline = time.monotonic() + timeout_seconds
+    session = agent_context.pc_state.get("browser_session")
+    if _should_use_web_dom(agent_context, prefer_web):
+        if not session:
+            session = _ensure_browser(agent_context)
+        remaining = max(0.5, deadline - time.monotonic())
+        try:
+            session.page.get_by_text(text).first.click(
+                timeout=int(remaining * 1000))
+            return
+        except Exception:
+            pass
 
     while time.monotonic() < deadline:
-        session = agent_context.pc_state.get("browser_session")
-        if session:
-            try:
-                session.page.get_by_text(text).first.click(timeout=1000)
-                return
-            except Exception:
-                pass
 
         element = find_ui_element(
             text, llm_client=llm_client, use_vision=False)
@@ -417,6 +902,9 @@ def _click_text(
             return
 
         time.sleep(0.5)
+
+    if _maybe_use_alt_menu_navigation(text, instruction, agent_context):
+        return
 
     if llm_client:
         if "search" in text.lower():
@@ -440,6 +928,44 @@ def _click_text(
                 return
 
     raise ExecutionError(f"Unable to click text: {text}")
+
+
+def _use_system_browser(agent_context: AgentContext) -> bool:
+    return bool(agent_context.pc_state.get("use_system_browser"))
+
+
+def _focus_browser_window(agent_context: AgentContext) -> None:
+    title = agent_context.pc_state.get("browser_window_title")
+    if not title:
+        return
+    try:
+        window = Desktop(backend="uia").window(title_re=str(title))
+        if window.exists(timeout=0.5):
+            window.set_focus()
+            time.sleep(0.1)
+    except Exception:
+        return
+
+
+def _is_browser_active_window(agent_context: AgentContext) -> bool:
+    try:
+        window = Desktop(backend="uia").get_active()
+        title = window.window_text() or ""
+        title_pattern = str(agent_context.pc_state.get("browser_window_title") or "")
+        if title_pattern and re.search(title_pattern, title, re.IGNORECASE):
+            return True
+        lowered = title.lower()
+        return any(token in lowered for token in ("chrome", "edge", "firefox", "brave", "opera"))
+    except Exception:
+        return False
+
+
+def _navigate_system_browser(url: str, agent_context: AgentContext) -> None:
+    _focus_browser_window(agent_context)
+    pyautogui.hotkey("ctrl", "l")
+    time.sleep(0.1)
+    pyautogui.typewrite(url, interval=0.02)
+    pyautogui.press("enter")
 
 
 def _is_spotify_active_window(agent_context: AgentContext) -> bool:

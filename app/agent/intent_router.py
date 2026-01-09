@@ -61,6 +61,9 @@ _IMAGE_EDIT_TOKENS = (
 _COMPUTER_USE_TOKENS = (
     "pc",
     "bilgisayar",
+    "site",
+    "siteye",
+    "web",
     "open",
     "ac",
     "launch",
@@ -78,6 +81,15 @@ _COMPUTER_USE_TOKENS = (
     "masaustu",
     "desktop",
     "wallpaper",
+    "linkedin",
+    "ilan",
+    "basvur",
+    "basvuru",
+    "apply",
+    "application",
+    "form",
+    "upload",
+    "cv",
 )
 _IMAGE_PRONOUN_TOKENS = ("bunu", "sunu", "su", "that",
                          "this", "o", "gorsel", "resim")
@@ -146,6 +158,7 @@ Guidance:
 - If the user wants a new image from a description, choose IMAGE_GEN.
 - If the user wants to take an action on the computer (including setting wallpaper), choose COMPUTER_USE.
 - If the user asks for time-sensitive factual info (exchange rates, news, weather), choose CHAT. The assistant can use built-in Google Search tools, so do not use COMPUTER_USE just to browse.
+- If the user asks for charts, graphs, or plots, choose CHAT. The assistant can generate charts without computer control.
 - If the user refers to "this/that" and context has a last_image, assume the reference is the last image.
 
 Context JSON:

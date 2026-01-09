@@ -24,6 +24,11 @@ ALLOWED_ACTIONS = {
     "focus_window",
     "wait_for_window",
     "run_executable",
+    "scroll",
+    "drag",
+    "wait",
+    "fill_form",
+    "upload_file",
 }
 
 
@@ -47,7 +52,7 @@ async def plan_pc_actions(
         if stream_handler:
             response_text = await stream_handler(prompt)
         else:
-            response_text = await asyncio.to_thread(llm_client.generate_text, prompt)
+            response_text = await _generate_plan_text(llm_client, prompt)
     except Exception as exc:  # pragma: no cover - network/proxy errors
         logger.error("LLM planning failed: %s", exc)
         return None
@@ -96,7 +101,7 @@ Rules:
   {{
     "steps": [
       {{
-        "name": "open_app|open_browser|navigate|click_text|vision_click|type_text|vision_type|keypress|mouse_click|mouse_move|focus_window|wait_for_window|run_executable",
+        "name": "open_app|open_browser|navigate|click_text|vision_click|type_text|vision_type|keypress|mouse_click|mouse_move|scroll|drag|wait|focus_window|wait_for_window|run_executable|fill_form|upload_file",
         "description": "short description",
         "risk": "LOW|MEDIUM|HIGH",
         "reversible": true|false,
@@ -109,12 +114,16 @@ Rules:
 - If you need to click a button or label, use "click_text" with the visible text.
 - If the visible text is unknown or the app is a native desktop UI, prefer "vision_click".
 - For text input in native desktop apps, prefer "vision_type" or provide an "instruction".
+- If using "type_text" without a selector or label, ALWAYS include an "instruction".
 - For messaging apps, always include steps to: focus the search bar, search the contact, click the matching chat result, focus the message input, then type and send (press_enter true).
+- Use "scroll" when content is below the fold.
+- Use "wait" for page loads or slow app responses.
 - Keep steps short and minimal.
 - After opening a desktop app, ensure the app window is ready (use "wait_for_window" or include window_title in "open_app").
 
 Payload fields:
 - open_app: {{ "name": "Steam", "window_title": ".*Steam.*", "timeout_seconds": 45 }}
+- open_browser: {{ "name": "Chrome", "window_title": ".*Chrome.*" }}
 - navigate: {{ "url": "https://example.com" }}
   - click_text: {{ "text": "Sign in", "instruction": "click the Sign in button" }}
   - vision_click: {{ "instruction": "click the search box in WhatsApp (top left)" }}
@@ -123,13 +132,39 @@ Payload fields:
 - keypress: {{ "key": "enter" }}
 - mouse_click: {{ "x": 100, "y": 200 }}
 - mouse_move: {{ "x": 100, "y": 200 }}
+- scroll: {{ "direction": "down|up|left|right", "amount": 600, "x": 800, "y": 500 }}
+- drag: {{ "start_x": 100, "start_y": 200, "end_x": 300, "end_y": 200, "duration": 0.6 }}
+- drag: {{ "from_instruction": "drag the slider handle", "to_instruction": "drop at 75%" }}
+- wait: {{ "seconds": 2.5 }}
 - focus_window: {{ "title": ".*Chrome.*" }}
 - wait_for_window: {{ "title": ".*Spotify.*", "timeout_seconds": 30, "focus": true }}
 - run_executable: {{ "path": "C:\\\\Program Files\\\\App\\\\app.exe" }}
+- fill_form: {{ "fields": [{{ "label": "Email", "value": "me@example.com" }}] }}
+- upload_file: {{ "selector": "input[type=file]", "path": "C:\\\\Users\\\\Me\\\\cv.pdf" }}
 {context_block}
 
 User task: {task}
 """.strip()
+
+
+async def _generate_plan_text(llm_client: LLMClient, prompt: str) -> str:
+    if hasattr(llm_client, "_client") and hasattr(llm_client, "_model"):
+        try:
+            from google.genai import types
+        except ModuleNotFoundError:
+            return await asyncio.to_thread(llm_client.generate_text, prompt)
+        config = types.GenerateContentConfig()
+        if hasattr(config, "response_mime_type"):
+            config.response_mime_type = "application/json"
+        if hasattr(config, "tools"):
+            config.tools = []
+        response = llm_client._client.models.generate_content(
+            model=llm_client._model,
+            contents=prompt,
+            config=config,
+        )
+        return getattr(response, "text", "") or ""
+    return await asyncio.to_thread(llm_client.generate_text, prompt)
 
 
 def _parse_steps(text: str) -> list[dict[str, Any]] | None:

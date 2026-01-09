@@ -26,6 +26,9 @@ class MessageRow:
     timestamp: str
     file_path: str | None = None
     file_type: str | None = None
+    source: str | None = None
+    source_message_id: str | None = None
+    source_chat_id: str | None = None
 
 
 class DatabaseManager:
@@ -52,6 +55,9 @@ class DatabaseManager:
             timestamp TEXT NOT NULL,
             file_path TEXT,
             file_type TEXT,
+            source TEXT,
+            source_message_id TEXT,
+            source_chat_id TEXT,
             CHECK (role IN ('user', 'assistant', 'system', 'tool'))
         );
         CREATE INDEX IF NOT EXISTS idx_messages_user_time
@@ -195,6 +201,7 @@ class DatabaseManager:
         """
         with self._lock, self._connection:
             self._connection.executescript(schema)
+        self._ensure_message_columns()
 
     def add_message(
         self,
@@ -204,22 +211,39 @@ class DatabaseManager:
         timestamp: str | None = None,
         file_path: str | None = None,
         file_type: str | None = None,
+        source: str | None = None,
+        source_message_id: str | None = None,
+        source_chat_id: str | None = None,
     ) -> int:
         timestamp = timestamp or _utc_now()
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 """
-                INSERT INTO messages (user_id, role, content, timestamp, file_path, file_type)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO messages (
+                    user_id, role, content, timestamp, file_path, file_type,
+                    source, source_message_id, source_chat_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, role, content, timestamp, file_path, file_type),
+                (
+                    user_id,
+                    role,
+                    content,
+                    timestamp,
+                    file_path,
+                    file_type,
+                    source,
+                    source_message_id,
+                    source_chat_id,
+                ),
             )
             return int(cursor.lastrowid)
 
     def get_recent_messages(self, user_id: str, limit: int) -> list[MessageRow]:
         rows = self._fetchall(
             """
-            SELECT role, content, timestamp, file_path, file_type
+            SELECT role, content, timestamp, file_path, file_type,
+                   source, source_message_id, source_chat_id
             FROM messages
             WHERE user_id = ?
             ORDER BY timestamp DESC, id DESC
@@ -234,9 +258,123 @@ class DatabaseManager:
                 timestamp=row["timestamp"],
                 file_path=row["file_path"],
                 file_type=row["file_type"],
+                source=row["source"],
+                source_message_id=row["source_message_id"],
+                source_chat_id=row["source_chat_id"],
             )
             for row in rows
         ]
+
+    def get_message_by_source_id(
+        self,
+        user_id: str,
+        source: str,
+        source_message_id: str,
+        source_chat_id: str | None,
+    ) -> MessageRow | None:
+        if not user_id or not source_message_id:
+            return None
+        where = "user_id = ? AND source = ? AND source_message_id = ?"
+        params: list[Any] = [user_id, source, source_message_id]
+        if source_chat_id is not None:
+            where += " AND source_chat_id = ?"
+            params.append(source_chat_id)
+        rows = self._fetchall(
+            f"""
+            SELECT role, content, timestamp, file_path, file_type,
+                   source, source_message_id, source_chat_id
+            FROM messages
+            WHERE {where}
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            """,
+            params,
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return MessageRow(
+            role=row["role"],
+            content=row["content"],
+            timestamp=row["timestamp"],
+            file_path=row["file_path"],
+            file_type=row["file_type"],
+            source=row["source"],
+            source_message_id=row["source_message_id"],
+            source_chat_id=row["source_chat_id"],
+        )
+
+    def find_message_by_content(
+        self,
+        user_id: str,
+        content: str,
+        role: str | None = None,
+    ) -> MessageRow | None:
+        if not user_id or not content:
+            return None
+        where = "user_id = ? AND content = ?"
+        params: list[Any] = [user_id, content]
+        if role:
+            where += " AND role = ?"
+            params.append(role)
+        rows = self._fetchall(
+            f"""
+            SELECT role, content, timestamp, file_path, file_type,
+                   source, source_message_id, source_chat_id
+            FROM messages
+            WHERE {where}
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            """,
+            params,
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return MessageRow(
+            role=row["role"],
+            content=row["content"],
+            timestamp=row["timestamp"],
+            file_path=row["file_path"],
+            file_type=row["file_type"],
+            source=row["source"],
+            source_message_id=row["source_message_id"],
+            source_chat_id=row["source_chat_id"],
+        )
+
+    def update_message_source(
+        self,
+        message_id: int,
+        *,
+        source: str | None,
+        source_message_id: str | None,
+        source_chat_id: str | None,
+    ) -> None:
+        if not message_id:
+            return
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE messages
+                SET source = ?, source_message_id = ?, source_chat_id = ?
+                WHERE id = ?
+                """,
+                (source, source_message_id, source_chat_id, message_id),
+            )
+
+    def delete_messages(self, user_id: str) -> list[str]:
+        rows = self._fetchall(
+            """
+            SELECT DISTINCT file_path
+            FROM messages
+            WHERE user_id = ? AND file_path IS NOT NULL
+            """,
+            (user_id,),
+        )
+        file_paths = [row["file_path"] for row in rows if row["file_path"]]
+        with self._lock, self._connection:
+            self._connection.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
+        return file_paths
 
     def load_sessions(self) -> dict[str, dict[str, Any]]:
         sessions = {}
@@ -720,6 +858,29 @@ class DatabaseManager:
         with self._lock:
             cursor = self._connection.execute(query, params or ())
             return cursor.fetchone()
+
+    def _ensure_message_columns(self) -> None:
+        columns = {row["name"] for row in self._fetchall("PRAGMA table_info(messages)")}
+        missing: list[tuple[str, str]] = []
+        if "source" not in columns:
+            missing.append(("source", "TEXT"))
+        if "source_message_id" not in columns:
+            missing.append(("source_message_id", "TEXT"))
+        if "source_chat_id" not in columns:
+            missing.append(("source_chat_id", "TEXT"))
+        if missing:
+            with self._lock, self._connection:
+                for name, column_type in missing:
+                    self._connection.execute(
+                        f"ALTER TABLE messages ADD COLUMN {name} {column_type}"
+                    )
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_messages_source
+                ON messages(user_id, source, source_chat_id, source_message_id)
+                """
+            )
 
     @staticmethod
     def _group_rows(rows: list[sqlite3.Row], key_field: str, value_field: str) -> dict[int, list[str]]:

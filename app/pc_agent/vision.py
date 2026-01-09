@@ -76,6 +76,12 @@ def _vision_locate(prompt: str, llm_client: Any) -> tuple[int, int] | None:
         build_config = getattr(llm_client, "build_generate_config", None)
         if callable(build_config):
             config = build_config()
+        if config is None:
+            config = types.GenerateContentConfig()
+        if hasattr(config, "response_mime_type"):
+            config.response_mime_type = "application/json"
+        if hasattr(config, "tools"):
+            config.tools = []
         response = client.models.generate_content(
             model=llm_client._model,
             contents=[
@@ -87,13 +93,15 @@ def _vision_locate(prompt: str, llm_client: Any) -> tuple[int, int] | None:
 
         import json
 
-        text = response.text
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
-
-        result = json.loads(text)
+        text = getattr(response, "text", "") or ""
+        cleaned = _extract_json(text)
+        if not cleaned:
+            return None
+        try:
+            result = json.loads(cleaned)
+        except json.JSONDecodeError:
+            logger.warning("Vision JSON parse failed: %s", cleaned[:200])
+            return None
 
         if not result.get("found"):
             return None
@@ -148,6 +156,24 @@ def _vision_locate(prompt: str, llm_client: Any) -> tuple[int, int] | None:
     except Exception as exc:
         logger.error("Vision analysis failed: %s", exc)
         return None
+
+
+def _extract_json(text: str) -> str:
+    cleaned = text.strip()
+    if "```" in cleaned:
+        parts = cleaned.split("```")
+        for part in parts:
+            if "{" in part:
+                cleaned = part
+                break
+    cleaned = cleaned.strip()
+    brace_index = cleaned.find("{")
+    if brace_index != -1:
+        cleaned = cleaned[brace_index:]
+    end_index = cleaned.rfind("}")
+    if end_index != -1:
+        cleaned = cleaned[: end_index + 1]
+    return cleaned
 
 
 def locate_ui_point(instruction: str, llm_client: Any) -> tuple[int, int] | None:

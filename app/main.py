@@ -172,7 +172,12 @@ async def main() -> None:
                 memory=memory,
                 application=application,
             )
-        await context.stop_event.wait()
+        while True:
+            await context.stop_event.wait()
+            if context.stop_reason == "telegram_job_search_stop":
+                context.clear_stop()
+                continue
+            break
         context.complete()
         logger.info("Agent completed")
     finally:
