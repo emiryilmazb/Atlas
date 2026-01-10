@@ -15,7 +15,8 @@ _LOADED = False
 _SESSIONS: dict[str, "SessionState"] = {}
 
 _SHORT_TERM_LIMIT = 5
-_RESET_TOKENS = ("iptal", "reset", "cancel")
+_RECENT_IMAGE_LIMIT = 10
+_RESET_TOKENS = ("reset", "cancel", "stop", "iptal")
 
 _APP_ALIASES: dict[str, tuple[str, ...]] = {
     "whatsapp": ("whatsapp", "whats app"),
@@ -48,6 +49,7 @@ class SessionState:
     last_image_prompt: str | None = None
     last_image_summary: str | None = None
     last_image_source: str | None = None
+    recent_images: list[dict[str, Any]] = field(default_factory=list)
 
 
 def get_session_context(user_id: str | None) -> dict[str, Any] | None:
@@ -65,6 +67,7 @@ def get_session_context(user_id: str | None) -> dict[str, Any] | None:
         "last_image_prompt": session.last_image_prompt,
         "last_image_summary": session.last_image_summary,
         "last_image_source": session.last_image_source,
+        "recent_images": session.recent_images,
     }
     if not any(context.values()):
         return None
@@ -162,15 +165,20 @@ def record_image_result(
         return
     with _LOCK:
         session = _get_or_create_session(user_id)
+        summary = _build_image_summary(prompt, source)
         session.last_image_path = image_path
         session.last_image_prompt = prompt
-        summary_parts = []
-        if source:
-            summary_parts.append(source)
-        if prompt:
-            summary_parts.append(prompt)
-        session.last_image_summary = ": ".join(summary_parts) if summary_parts else None
+        session.last_image_summary = summary
         session.last_image_source = source
+        session.recent_images.append(
+            {
+                "path": image_path,
+                "prompt": prompt,
+                "summary": summary,
+                "source": source,
+            }
+        )
+        session.recent_images = _trim_recent_images(session.recent_images)
         _SESSIONS[user_id] = session
         _save_sessions()
 
@@ -231,12 +239,13 @@ def _extract_pending_details_from_action(
     is_search = "search" in description_norm or "search" in instruction_norm or "ara" in description_norm
     is_message = any(
         token in description_norm
-        for token in ("message", "mesaj", "send", "yaz", "gonder", "yolla", "ileti")
-    ) or any(token in instruction_norm for token in ("message", "mesaj", "send", "yaz", "gonder", "yolla", "ileti"))
+        for token in ("message", "send", "reply", "mesaj", "yaz", "gonder", "yolla", "ileti")
+    ) or any(token in instruction_norm for token in ("message", "send", "reply", "mesaj", "yaz", "gonder", "yolla", "ileti"))
     is_contact = (
         "contact" in description_norm
         or "chat" in description_norm
         or "message" in description_norm
+        or "chat" in description_norm
         or "sohbet" in description_norm
     )
     if name == "click_text" and is_contact and text_value:
@@ -332,7 +341,9 @@ def _load_sessions() -> None:
             last_image_prompt=data.get("last_image_prompt"),
             last_image_summary=data.get("last_image_summary"),
             last_image_source=data.get("last_image_source"),
+            recent_images=_normalize_recent_images(data.get("recent_images")),
         )
+        _hydrate_last_image_from_recent(_SESSIONS[str(user_id)])
 
 
 def _save_sessions() -> None:
@@ -350,6 +361,7 @@ def _save_sessions() -> None:
                 last_image_prompt=state.last_image_prompt,
                 last_image_summary=state.last_image_summary,
                 last_image_source=state.last_image_source,
+                recent_images=state.recent_images,
             )
     except Exception as exc:
         logger.warning("Session store save failed: %s", exc)
@@ -362,3 +374,61 @@ def _get_or_create_session(user_id: str) -> SessionState:
         session = SessionState(user_id=user_id)
         _SESSIONS[user_id] = session
     return session
+
+
+def _build_image_summary(prompt: str | None, source: str | None) -> str | None:
+    summary_parts = []
+    if source:
+        summary_parts.append(source)
+    if prompt:
+        summary_parts.append(prompt)
+    return ": ".join(summary_parts) if summary_parts else None
+
+
+def _normalize_recent_images(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path")
+        if not path:
+            continue
+        normalized.append(
+            {
+                "path": str(path),
+                "prompt": item.get("prompt"),
+                "summary": item.get("summary"),
+                "source": item.get("source"),
+            }
+        )
+    return _trim_recent_images(normalized)
+
+
+def _hydrate_last_image_from_recent(session: SessionState) -> None:
+    if session.recent_images:
+        last = session.recent_images[-1]
+        session.last_image_path = last.get("path") or session.last_image_path
+        session.last_image_prompt = last.get("prompt") or session.last_image_prompt
+        session.last_image_summary = last.get("summary") or session.last_image_summary
+        session.last_image_source = last.get("source") or session.last_image_source
+        return
+    if session.last_image_path:
+        summary = session.last_image_summary or _build_image_summary(
+            session.last_image_prompt, session.last_image_source
+        )
+        session.recent_images = [
+            {
+                "path": session.last_image_path,
+                "prompt": session.last_image_prompt,
+                "summary": summary,
+                "source": session.last_image_source,
+            }
+        ]
+
+
+def _trim_recent_images(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(images) <= _RECENT_IMAGE_LIMIT:
+        return images
+    return images[-_RECENT_IMAGE_LIMIT:]

@@ -10,9 +10,15 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
 
 @dataclass(frozen=True)
 class Settings:
-    app_name: str = "ApplyWise"
+    app_name: str = "Atlas"
     log_level: str = "INFO"
     sqlite_db_path: str = ""
+    memory_enabled: bool = True
+    memory_summary_every_n_user_msg: int = 12
+    memory_retrieval_top_k: int = 5
+    embedding_backend: str = "sentence_transformers"
+    embedding_model_name: str = "all-MiniLM-L6-v2"
+    anonymity_default_off: bool = True
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     gemini_api_key: str = ""
@@ -20,6 +26,20 @@ class Settings:
     gemini_image_model: str = "gemini-3-pro-image-preview"
     gemini_enable_google_search: bool = True
     gemini_enable_code_execution: bool = True
+    gmail_credentials_path: str = ""
+    gmail_token_path: str = ""
+    gmail_scopes: str = ""
+    gmail_user_id: str = "me"
+    gmail_poll_enabled: bool = False
+    gmail_poll_interval_seconds: int = 120
+    gmail_poll_max_results: int = 10
+    gmail_vip_senders: str = ""
+    gmail_vip_only: bool = False
+    gmail_later_label: str = "Later"
+    gmail_focus_mode: bool = False
+    gmail_focus_labels: str = "Critical,Action Required"
+    gmail_oauth_flow: str = "local"
+    gmail_oauth_open_browser: bool = True
     streaming_enabled: bool = True
     show_thoughts: bool = True
     screenshot_enabled: bool = True
@@ -45,12 +65,34 @@ def _env_flag(name: str, default: bool) -> bool:
     return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
 def get_settings() -> Settings:
     load_dotenv()
     return Settings(
-        app_name=os.getenv("APPLYWISE_APP_NAME", "ApplyWise"),
-        log_level=os.getenv("APPLYWISE_LOG_LEVEL", "INFO"),
+        app_name=(
+            os.getenv("ATLAS_APP_NAME")
+            or os.getenv("APPLYWISE_APP_NAME", "Atlas")
+        ),
+        log_level=(
+            os.getenv("ATLAS_LOG_LEVEL")
+            or os.getenv("APPLYWISE_LOG_LEVEL", "INFO")
+        ),
         sqlite_db_path=os.getenv("SQLITE_DB_PATH", ""),
+        memory_enabled=_env_flag("MEMORY_ENABLED", True),
+        memory_summary_every_n_user_msg=_env_int("MEMORY_SUMMARY_EVERY_N_USER_MSG", 12),
+        memory_retrieval_top_k=_env_int("MEMORY_RETRIEVAL_TOP_K", 5),
+        embedding_backend=os.getenv("EMBEDDING_BACKEND", "sentence_transformers"),
+        embedding_model_name=os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2"),
+        anonymity_default_off=_env_flag("ANONYMITY_DEFAULT_OFF", True),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
@@ -58,6 +100,20 @@ def get_settings() -> Settings:
         gemini_image_model=os.getenv("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview"),
         gemini_enable_google_search=_env_flag("GEMINI_ENABLE_GOOGLE_SEARCH", True),
         gemini_enable_code_execution=_env_flag("GEMINI_ENABLE_CODE_EXECUTION", True),
+        gmail_credentials_path=os.getenv("GMAIL_OAUTH_CREDENTIALS_PATH", ""),
+        gmail_token_path=os.getenv("GMAIL_OAUTH_TOKEN_PATH", ""),
+        gmail_scopes=os.getenv("GMAIL_SCOPES", ""),
+        gmail_user_id=os.getenv("GMAIL_USER_ID", "me"),
+        gmail_poll_enabled=_env_flag("GMAIL_POLL_ENABLED", False),
+        gmail_poll_interval_seconds=_env_int("GMAIL_POLL_INTERVAL_SECONDS", 120),
+        gmail_poll_max_results=_env_int("GMAIL_POLL_MAX_RESULTS", 10),
+        gmail_vip_senders=os.getenv("GMAIL_VIP_SENDERS", ""),
+        gmail_vip_only=_env_flag("GMAIL_VIP_ONLY", False),
+        gmail_later_label=os.getenv("GMAIL_LATER_LABEL", "Later"),
+        gmail_focus_mode=_env_flag("GMAIL_FOCUS_MODE", False),
+        gmail_focus_labels=os.getenv("GMAIL_FOCUS_LABELS", "Critical,Action Required"),
+        gmail_oauth_flow=os.getenv("GMAIL_OAUTH_FLOW", "local"),
+        gmail_oauth_open_browser=_env_flag("GMAIL_OAUTH_OPEN_BROWSER", True),
         streaming_enabled=_env_flag("STREAMING_ENABLED", True),
         show_thoughts=_env_flag("SHOW_THOUGHTS", True),
         screenshot_enabled=_env_flag("SCREENSHOT_ENABLED", True),

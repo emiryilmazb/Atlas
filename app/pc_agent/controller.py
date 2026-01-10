@@ -108,7 +108,7 @@ async def run_task_with_approval(
         if streaming_enabled and hasattr(llm_client, "stream_text") and telegram_app and chat_id:
             live_message = await telegram_app.bot.send_message(
                 chat_id=chat_id,
-                text="⏳ Revising plan...",
+                text="Revising plan...",
                 parse_mode=ParseMode.HTML,
             )
             manager = MessageManager(
@@ -311,6 +311,7 @@ def _configure_search_context(agent_context: AgentContext, task: str, actions) -
                 "play" in combined
                 or "result" in combined
                 or "song" in combined
+                or "track" in combined
                 or "sarki" in combined
                 or "cal" in combined
                 or "oynat" in combined
@@ -346,7 +347,7 @@ def _derive_search_query(task: str) -> str:
     query = _strip_tokens(
         query,
         ("spotify", "open", "launch", "play",
-         "song", "sarki", "cal", "oynat", "baslat"),
+         "song", "track", "start", "sarki", "cal", "oynat", "baslat"),
     )
     return query.strip(" .,-") or task.strip()
 

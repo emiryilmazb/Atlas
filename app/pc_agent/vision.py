@@ -221,7 +221,7 @@ def locate_whatsapp_search_result(contact_name: str, llm_client: Any) -> tuple[i
 You are automating WhatsApp Desktop.
 Look at the left panel where the search results are listed (below the search bar).
 Find the contact row for "{contact_name}".
-The result might look like "{contact_name}" or "{contact_name} ❤️" or similar.
+The result might look like "{contact_name}" or "{contact_name} *" or similar.
 Ignore the narrow navigation bar on the far left (with icons like chat bubbles, phone, gears).
 Do not return the search input field or the typed query in the search bar.
 Do not click anything in the right chat panel.
@@ -244,8 +244,8 @@ def find_spotify_first_result(llm_client: Any) -> dict[str, Any] | None:
     prompt = """
 You are looking at the Spotify desktop app search results.
 Find the first playable result row in the results list (not the search bar).
-Prefer the first row under the "Songs" section (may be labeled "Şarkılar").
-If "Songs" is not visible, use the first visible result row under "Top result" (may be labeled "En çok dinlenen sonuç") or the first visible result row.
+Prefer the first row under the "Songs" section.
+If "Songs" is not visible, use the first visible result row under "Top result" or the first visible result row.
 Return ONLY a JSON object with this structure:
 {
   "found": true,
@@ -317,7 +317,7 @@ If the Pause button is not visible, return { "found": false }.
 def find_spotify_row_play_button(llm_client: Any) -> dict[str, Any] | None:
     prompt = """
 You are looking at the Spotify desktop app search results.
-Find the Play button that appears when hovering the first song row in the Songs (Şarkılar) list.
+Find the Play button that appears when hovering the first song row in the Songs list.
 The button is a small green circle with a triangle (play icon) near the row.
 Return ONLY a JSON object with this structure:
 {
@@ -354,8 +354,8 @@ If the Play button is not visible, return { "found": false }.
 def find_spotify_top_result_play_button(llm_client: Any) -> dict[str, Any] | None:
     prompt = """
 You are looking at the Spotify desktop app search results.
-Find the large green Play button shown on the "Top result" card
-(may be labeled "En çok dinlenen sonuç"). The button is a green circle
+Find the large green Play button shown on the "Top result" card.
+The button is a green circle
 with a triangle icon, typically on the right side of the top result card.
 Return ONLY a JSON object with this structure:
 {

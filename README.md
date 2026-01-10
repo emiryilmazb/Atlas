@@ -1,14 +1,14 @@
-# ApplyWise
+# Atlas
 
 **The Next-Generation AI Agent for Autonomous Computer Use**
 
-ApplyWise is a cutting-edge Python-based AI agent designed to interact with your computer just like a human does. Powered by advanced multimodal Large Language Models (LLMs) like Google Gemini, ApplyWise "sees" your screen, understands complex user interfaces, and autonomously navigates through desktop and web applications to execute tasks with precision.
+Atlas is a cutting-edge Python-based AI agent designed to interact with your computer just like a human does. Powered by advanced multimodal Large Language Models (LLMs) like Google Gemini, Atlas "sees" your screen, understands complex user interfaces, and autonomously navigates through desktop and web applications to execute tasks with precision.
 
-While its core architecture is built for **General Computer Use**, ApplyWise shines brightest in its ability to automate one of the most tedious tasks in modern life: **Job Applications**.
+While its core architecture is built for **General Computer Use**, Atlas shines brightest in its ability to automate one of the most tedious tasks in modern life: **Job Applications**.
 
 ## 🚀 The Vision: True Computer Use
 
-ApplyWise isn't just a script; it's an intelligent agent that bridges the gap between AI and your operating system. By leveraging **Vision-Language Models (VLMs)**, it breaks free from fragile DOM selectors and API limitations, interacting with applications visually and logically.
+Atlas isn't just a script; it's an intelligent agent that bridges the gap between AI and your operating system. By leveraging **Vision-Language Models (VLMs)**, it breaks free from fragile DOM selectors and API limitations, interacting with applications visually and logically.
 
 ### Core Capabilities
 
@@ -19,7 +19,7 @@ ApplyWise isn't just a script; it's an intelligent agent that bridges the gap be
 
 ## 🌟 Feature Spotlight: Autonomous Job Applications
 
-ApplyWise leverages its powerful Computer Use foundation to revolutionize the job hunt. It acts as your tireless personal recruiter working 24/7.
+Atlas leverages its powerful Computer Use foundation to revolutionize the job hunt. It acts as your tireless personal recruiter working 24/7.
 
 - **Smart Search & Match:** Automatically scans platforms like **Kariyer.net** (with architecture ready for LinkedIn) to find roles matching your specific CV profile and experience.
 - **Auto-Apply Workflow:** Navigates application forms, fills in details, uploads resumes, and handles multi-step submissions without lifting a finger.
@@ -38,8 +38,8 @@ ApplyWise leverages its powerful Computer Use foundation to revolutionize the jo
 1.  **Clone the Repository**
 
     ```bash
-    git clone https://github.com/yourusername/applywise.git
-    cd applywise
+    git clone https://github.com/yourusername/atlas.git
+    cd atlas
     ```
 
 2.  **Create a Virtual Environment**
@@ -65,7 +65,7 @@ ApplyWise leverages its powerful Computer Use foundation to revolutionize the jo
     Copy `.env.example` to `.env` and fill in your credentials:
 
     ```ini
-    APPLYWISE_APP_NAME=ApplyWise
+    ATLAS_APP_NAME=Atlas
 
     # Telegram Configuration
     TELEGRAM_BOT_TOKEN=your_telegram_bot_token
@@ -97,6 +97,10 @@ python -m app.main
 Once running, the agent will message you on Telegram: _"The app is running. What should I do?"_
 
 You can command it to start the **"Job Search"** workflow or interact with its other PC agent capabilities directly through the chat interface.
+
+## Memory and Privacy
+
+Atlas can store long-term conversation summaries and a lightweight user profile to improve recall across days. Anonymous mode (`anonim on`) stops new message and memory writes. See `MEMORY.md` for details and configuration.
 
 ## 📂 Architecture
 

@@ -1,7 +1,8 @@
 import asyncio
 import inspect
 import io
-from dataclasses import replace
+import time
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 import logging
@@ -9,6 +10,7 @@ import mimetypes
 from pathlib import Path
 import random
 import re
+from uuid import uuid4
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -23,6 +25,7 @@ from app.agent.llm_client import (
     GEMINI_IMAGE_MIME_TYPES,
 )
 from app.config import get_settings
+from app.memory.long_term import ConversationMemoryManager, migrate_profile_json
 from app.session_manager import (
     clear_session,
     get_session_context,
@@ -30,7 +33,9 @@ from app.session_manager import (
     record_user_message,
     should_reset_context,
 )
+from app.services.gmail_service import GMAIL_LABELS, DraftSpec, build_gmail_service
 from app.storage.database import get_database
+from app.storage.user_settings import is_anonymous_mode, set_anonymous_mode
 from app.telegram.streaming import AsyncStreamHandler, MessageManager
 
 logger = logging.getLogger(__name__)
@@ -54,13 +59,17 @@ _IMAGE_EDIT_TOKENS = (
     "color",
     "background",
     "arka plan",
+    "retouch",
+    "adjust",
 )
 _EXPLICIT_IMAGE_TOKENS = (
-    "resim",
-    "gorsel",
     "image",
     "photo",
     "picture",
+    "visual",
+    "pic",
+    "resim",
+    "gorsel",
     "foto",
     "fotograf",
 )
@@ -85,6 +94,13 @@ _ANALYSIS_TOKENS = (
     "does it look",
     "what is",
     "whats",
+    "what do you see",
+    "is it suitable",
+    "evaluate",
+    "review it",
+    "comment",
+    "give feedback",
+    "how does it look now",
     "nedir",
     "tanimla",
     "acikla",
@@ -93,19 +109,29 @@ _ANALYSIS_TOKENS = (
     "uygun mu",
     "sence",
     "degerlendir",
-    "degerlendirir misin",
     "yorumla",
     "fikir ver",
     "nasil duruyor",
     "nasil gorunuyor",
     "bu hali nasil",
-    "bu halin nasil",
     "simdi nasil",
+)
+_IMAGE_COMPARE_TOKENS = (
+    "compare",
+    "which",
+    "prefer",
+    "better",
+    "best",
+    "karsilastir",
+    "hangisi",
+    "hangisini",
+    "tercih",
 )
 _CHAT_CONTEXT_LIMIT = 20
 _SUGGESTION_PREFIX = "SUGG:"
 _TELEGRAM_TEXT_CHUNK = 3500
 _TELEGRAM_CAPTION_LIMIT = 1024
+_DRAFT_PREVIEW_MAX_BODY = _TELEGRAM_TEXT_CHUNK - 200
 _STREAM_RETRY_ATTEMPTS = 3
 _STREAM_RETRY_BASE_DELAY = 0.6
 _STREAM_RETRY_MAX_DELAY = 3.0
@@ -116,9 +142,9 @@ _TELEGRAM_REPLY_RETRY_ATTEMPTS = 2
 _TELEGRAM_REPLY_RETRY_BASE_DELAY = 0.4
 _TELEGRAM_REPLY_RETRY_MAX_DELAY = 2.0
 _MAX_SOURCE_COUNT = 5
+_PENDING_DOCUMENT_TTL_SECONDS = 20 * 60
 _CHART_TOKENS = (
     "chart",
-    "grafik",
     "plot",
     "bar",
     "bar chart",
@@ -129,25 +155,26 @@ _CHART_TOKENS = (
     "cizgi",
     "moving average",
     "hareketli ortalama",
-    "sutun",
     "column",
+    "grafik",
+    "sutun",
 )
 _CANDLE_TOKENS = (
     "candlestick",
-    "kandil",
     "ohlc",
+    "kandil",
 )
 _LINE_TOKENS = (
     "line",
-    "cizgi",
     "moving average",
+    "cizgi",
     "hareketli ortalama",
 )
 _MA_TOKENS = (
     "moving average",
-    "hareketli ortalama",
-    "ortalama",
+    "average",
     "ma",
+    "ortalama",
 )
 _CHART_MAX_ITEMS = 8
 _CHART_WIDTH = 900
@@ -155,20 +182,31 @@ _CHART_HEIGHT = 600
 _BYTES_PER_MB = 1024 * 1024
 _DEFAULT_AUDIO_PROMPT = "Transcribe the audio and provide a concise summary."
 _DEFAULT_VIDEO_PROMPT = "Summarize the video and transcribe any spoken audio."
-_CLEAR_HISTORY_COMMANDS = {"clear_history", "clear history", "/clear_history"}
-_CLEAR_HISTORY_CONFIRM_TOKENS = {"yes", "y", "evet", "onay", "onayla"}
-_CLEAR_HISTORY_CANCEL_TOKENS = {"no", "n", "hayir", "iptal", "vazgec"}
+_CLEAR_HISTORY_COMMANDS = {
+    "clear_history",
+    "clear history",
+    "/clear_history",
+    "gecmis temizle",
+    "sohbet gecmisi temizle",
+}
+_CLEAR_HISTORY_CONFIRM_TOKENS = {"yes", "y", "confirm", "evet", "onay", "onayla"}
+_CLEAR_HISTORY_CANCEL_TOKENS = {"no", "n", "cancel", "hayir", "iptal", "vazgec"}
 _CLEAR_HISTORY_FLAG = "awaiting_clear_history_confirmation"
 _THINKING_ON_COMMAND = "thinking_on"
 _THINKING_OFF_COMMAND = "thinking_off"
 _SCREENSHOT_ON_COMMAND = "screenshot on"
 _SCREENSHOT_OFF_COMMAND = "screenshot off"
-_COMMAND_LIST_COMMANDS = {"komutlar", "/komutlar",
-                          "commands", "/commands", "/help", "help"}
+_ANON_ON_COMMANDS = {"anonymous on", "anonim on"}
+_ANON_OFF_COMMANDS = {"anonymous off", "anonim off"}
+_COMMAND_LIST_COMMANDS = {"commands", "/commands", "/help", "help", "komutlar", "/komutlar"}
 _CLEAR_HISTORY_CONFIRM_DATA = "clear_history_yes"
 _CLEAR_HISTORY_CANCEL_DATA = "clear_history_no"
+_GMAIL_SEND_CONFIRM_DATA = "gmail_send_yes"
+_GMAIL_SEND_CANCEL_DATA = "gmail_send_no"
 _APPROVAL_ID_PATTERN = re.compile(
     r"approval_id=([A-Za-z0-9-]+)", re.IGNORECASE)
+_GMAIL_APPROVE_TOKENS = {"yes", "y", "ok", "confirm", "approve", "evet", "onay", "onayla", "gonder"}
+_GMAIL_REJECT_TOKENS = {"no", "n", "cancel", "reject", "hayir", "iptal", "vazgec"}
 
 _ANALYSIS_CLASSIFIER_PROMPT = """
 You classify the user's request about an image.
@@ -187,11 +225,33 @@ _BUTTONS = [
 ]
 
 
+@dataclass(frozen=True)
+class PendingDocument:
+    path: str
+    mime_type: str | None
+    created_at: float
+
+
+_PENDING_DOCUMENTS: dict[str, PendingDocument] = {}
+
+
 def _resolve_user_id(update: Update) -> str | None:
     if update.effective_user and update.effective_user.id:
         return str(update.effective_user.id)
     if update.effective_chat and update.effective_chat.id:
         return str(update.effective_chat.id)
+    return None
+
+
+def _resolve_user_id_from_message(message) -> str | None:
+    if message is None:
+        return None
+    user = getattr(message, "from_user", None)
+    if user is not None and getattr(user, "id", None):
+        return str(user.id)
+    chat_id = getattr(message, "chat_id", None)
+    if chat_id:
+        return str(chat_id)
     return None
 
 
@@ -241,7 +301,7 @@ def _build_reply_context_note(message, user_id: str | None = None) -> str | None
     if not cleaned:
         return None
     cleaned = cleaned.replace('"', "'")
-    return f'Sistem Notu: "Kullanici su mesaja yanitliyor: {cleaned}"'
+    return f'System Note: "The user is replying to this message: {cleaned}"'
 
 
 def _lookup_reply_entry(reply, user_id: str | None):
@@ -281,7 +341,7 @@ def _format_reply_entry(entry) -> str | None:
     if not cleaned:
         return None
     cleaned = cleaned.replace('"', "'")
-    return f'Sistem Notu: "Kullanici su mesaja yanitliyor: {cleaned}"'
+    return f'System Note: "The user is replying to this message: {cleaned}"'
 
 
 def _extract_reply_content(reply) -> str | None:
@@ -403,6 +463,464 @@ def _resolve_settings(context: ContextTypes.DEFAULT_TYPE):
     return settings or get_settings()
 
 
+def _get_memory_manager(telegram_app, settings):
+    manager = telegram_app.bot_data.get("memory_manager")
+    if manager is None:
+        manager = ConversationMemoryManager(settings)
+        telegram_app.bot_data["memory_manager"] = manager
+    return manager
+
+
+def _get_gmail_service(context: ContextTypes.DEFAULT_TYPE):
+    service = context.application.bot_data.get("gmail_service")
+    if service is not None:
+        return service
+    settings = _resolve_settings(context)
+    service = build_gmail_service(settings)
+    context.application.bot_data["gmail_service"] = service
+    return service
+
+
+def _parse_limit_arg(value: str | None, default: int = 5, max_value: int = 25) -> int:
+    if not value:
+        return default
+    try:
+        parsed = int(value.strip())
+    except ValueError:
+        return default
+    return max(1, min(max_value, parsed))
+
+
+def _extract_first_email(text: str) -> str:
+    match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+    return match.group(0) if match else ""
+
+
+def _extract_limit_from_text(text: str, default: int = 5, max_value: int = 25) -> int:
+    match = re.search(r"\b(\d{1,3})\b", text)
+    if not match:
+        return default
+    try:
+        return _parse_limit_arg(match.group(1), default=default, max_value=max_value)
+    except ValueError:
+        return default
+
+
+def _should_send_email(text: str) -> bool:
+    normalized = _normalize_text(text or "")
+    return any(
+        token in normalized
+        for token in ("send", "email", "mail", "deliver", "gonder", "yolla", "eposta at")
+    )
+
+
+def _should_summarize_email(text: str) -> bool:
+    normalized = _normalize_text(text or "")
+    return any(token in normalized for token in ("summary", "summarize", "ozet"))
+
+
+def _store_gmail_pending_send(context: ContextTypes.DEFAULT_TYPE, question_id: str, payload: dict) -> None:
+    pending = context.application.bot_data.get("gmail_pending_send")
+    if not isinstance(pending, dict):
+        pending = {}
+    pending[question_id] = payload
+    context.application.bot_data["gmail_pending_send"] = pending
+
+
+def _pop_gmail_pending_send(context: ContextTypes.DEFAULT_TYPE, question_id: str) -> dict | None:
+    pending = context.application.bot_data.get("gmail_pending_send")
+    if not isinstance(pending, dict):
+        return None
+    return pending.pop(question_id, None)
+
+
+def _parse_json_block(text: str) -> dict | None:
+    if not text:
+        return None
+    match = re.search(r"{.*}", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_draft_request(llm_client, message_text: str) -> dict:
+    if llm_client is None:
+        email = _extract_first_email(message_text)
+        return {
+            "to": email,
+            "subject": "",
+            "prompt": message_text.strip(),
+            "needs_clarification": not bool(email),
+            "clarification_question": "Who should I send it to? Please provide an email address.",
+        }
+        prompt = (
+            "Extract email draft details from the user message.\n"
+            "Return ONLY JSON with keys: to, subject, prompt, needs_clarification, clarification_question.\n"
+            "- 'to' should be an email address if present.\n"
+            "- 'subject' can be empty.\n"
+            "- 'prompt' is the body request.\n"
+            "- If recipient missing, set needs_clarification=true and provide a short English question.\n\n"
+            f"Message: {message_text}\n"
+        )
+    response = llm_client.generate_text(prompt)
+    data = _parse_json_block(response) or {}
+    return {
+        "to": str(data.get("to") or "").strip(),
+        "subject": str(data.get("subject") or "").strip(),
+        "prompt": str(data.get("prompt") or "").strip() or message_text.strip(),
+        "needs_clarification": bool(data.get("needs_clarification")),
+        "clarification_question": str(data.get("clarification_question") or "").strip()
+        or "Who should I send it to? Please provide an email address.",
+    }
+
+
+def _build_draft_preview_text(spec: DraftSpec, max_body_chars: int = _DRAFT_PREVIEW_MAX_BODY) -> str:
+    body = (spec.body or "").strip()
+    if len(body) > max_body_chars:
+        body = f"{body[:max_body_chars].rstrip()}..."
+    return f"To: {spec.to}\nSubject: {spec.subject}\n\n{body}"
+
+
+async def _maybe_send_gmail_status(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    text: str,
+) -> None:
+    settings = _resolve_settings(context)
+    if not bool(getattr(settings, "show_thoughts", True)):
+        return
+    try:
+        await message.reply_text(text)
+    except Exception as exc:
+        logger.debug("Gmail status message failed: %s", exc)
+
+
+def _extract_signature_name(user_id: str | None) -> str | None:
+    if not user_id:
+        return None
+    db = get_database()
+    profile_json = db.get_user_profile(user_id)
+    if not profile_json:
+        return None
+    migrated_json, migrated = migrate_profile_json(profile_json)
+    if migrated:
+        profile_json = migrated_json
+        db.set_user_profile(user_id, profile_json)
+    try:
+        profile = json.loads(profile_json)
+    except Exception:
+        return None
+    if not isinstance(profile, dict):
+        return None
+    facts = profile.get("facts")
+    if not isinstance(facts, list) or not facts:
+        return None
+    normalized_map: dict[str, str] = {}
+    for item in facts:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        value = str(item.get("value") or "").strip()
+        if not key or not value:
+            continue
+        normalized_map[_normalize_text(key)] = value
+    full_name_keys = (
+        "ad soyad",
+        "isim soyisim",
+        "full name",
+        "name",
+        "isim",
+    )
+    for key in full_name_keys:
+        if key in normalized_map:
+            return normalized_map[key]
+    first = normalized_map.get("ad") or normalized_map.get("first name") or normalized_map.get("first_name")
+    last = normalized_map.get("soyad") or normalized_map.get("last name") or normalized_map.get("last_name")
+    if first and last:
+        return f"{first} {last}".strip()
+    return first or last
+
+
+def _apply_signature(spec: DraftSpec, signature_name: str | None) -> DraftSpec:
+    if not signature_name:
+        return spec
+    body = (spec.body or "").rstrip()
+    if body.endswith(signature_name):
+        return spec
+    updated_body = f"{body}\n\n{signature_name}" if body else signature_name
+    return DraftSpec(to=spec.to, subject=spec.subject, body=updated_body)
+
+
+def _parse_gmail_action_plan(intent: RouterIntent, payload: dict) -> dict:
+    operation = str(payload.get("operation") or "").strip().lower()
+    if not operation:
+        operation = {
+            RouterIntent.GMAIL_INBOX: "inbox",
+            RouterIntent.GMAIL_SUMMARY: "summary",
+            RouterIntent.GMAIL_SEARCH: "search",
+            RouterIntent.GMAIL_DRAFT: "draft",
+            RouterIntent.GMAIL_SEND: "send",
+            RouterIntent.GMAIL_QUESTION: "question",
+        }.get(intent, "question")
+    limit = payload.get("limit")
+    try:
+        limit_value = int(limit) if limit is not None else None
+    except (TypeError, ValueError):
+        limit_value = None
+    post_actions = payload.get("post_actions") if isinstance(payload.get("post_actions"), list) else []
+    vip_senders = payload.get("vip_senders") if isinstance(payload.get("vip_senders"), list) else []
+    return {
+        "operation": operation,
+        "query": str(payload.get("query") or "").strip(),
+        "question": str(payload.get("question") or "").strip(),
+        "limit": limit_value,
+        "draft": payload.get("draft") if isinstance(payload.get("draft"), dict) else {},
+        "post_actions": [str(item).strip() for item in post_actions if str(item).strip()],
+        "vip_senders": [str(item).strip() for item in vip_senders if str(item).strip()],
+        "focus_mode": payload.get("focus_mode"),
+        "vip_only": payload.get("vip_only"),
+    }
+
+
+async def _handle_gmail_intelligent_request(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    *,
+    intent: RouterIntent,
+    message_text: str,
+) -> bool:
+    llm_client = context.application.bot_data.get("llm_client")
+    if llm_client is None:
+        return False
+    await _maybe_send_gmail_status(context, message, "Gmail: processing request...")
+    try:
+        gmail_service = _get_gmail_service(context)
+    except Exception as exc:
+        logger.warning("Gmail service unavailable: %s", exc)
+        await message.reply_text("Gmail service is not configured.")
+        return True
+    prompt = (
+        "You are a Gmail action planner. Decide the best action for the user request.\n"
+        "Return ONLY JSON with keys:\n"
+        "operation: inbox|summary|search|question|thread_summary|extract_tasks|extract_schedule|sentiment|draft|send|count|newsletter_digest|prioritize\n"
+        "query: optional Gmail-style query or natural language\n"
+        "limit: optional integer\n"
+        "question: optional question to answer\n"
+        "draft: {to, subject, prompt} when drafting/sending\n"
+        "post_actions: optional list from [archive, label_later, label_newsletter]\n"
+        "vip_senders: optional list of emails\n"
+        "focus_mode: optional true/false\n"
+        "vip_only: optional true/false\n\n"
+        f"User message: {message_text}\n"
+    )
+    response = llm_client.generate_text(prompt)
+    payload = _parse_json_block(response) or {}
+    plan = _parse_gmail_action_plan(intent, payload)
+
+    settings = _resolve_settings(context)
+    if plan.get("focus_mode") is not None or plan.get("vip_only") is not None or plan.get("vip_senders"):
+        updated = replace(
+            settings,
+            gmail_focus_mode=bool(plan.get("focus_mode")) if plan.get("focus_mode") is not None else settings.gmail_focus_mode,
+            gmail_vip_only=bool(plan.get("vip_only")) if plan.get("vip_only") is not None else settings.gmail_vip_only,
+            gmail_vip_senders=",".join(plan.get("vip_senders")) if plan.get("vip_senders") else settings.gmail_vip_senders,
+        )
+        context.application.bot_data["settings"] = updated
+
+    operation = plan.get("operation")
+    limit = plan.get("limit") or _extract_limit_from_text(message_text, default=5, max_value=25)
+    query_text = plan.get("query") or message_text
+
+    if operation in {"draft", "send"}:
+        draft_data = plan.get("draft") or {}
+        recipient = str(draft_data.get("to") or "").strip() or _extract_first_email(message_text)
+        subject = str(draft_data.get("subject") or "").strip()
+        prompt_text = str(draft_data.get("prompt") or "").strip() or message_text
+        if not recipient:
+        await message.reply_text("Who should I send it to? Please provide an email address.")
+        return True
+        try:
+            spec = await asyncio.to_thread(
+                gmail_service.build_draft_from_prompt, llm_client, recipient, prompt_text
+            )
+            if subject:
+                spec = DraftSpec(to=spec.to, subject=subject, body=spec.body)
+            signature_name = _extract_signature_name(_resolve_user_id_from_message(message))
+            spec = _apply_signature(spec, signature_name)
+            draft_id = await asyncio.to_thread(gmail_service.create_draft, spec)
+        except Exception as exc:
+            logger.warning("Gmail draft failed: %s", exc)
+            await message.reply_text("Failed to create Gmail draft.")
+            return True
+        agent_context = context.application.bot_data.get("agent_context")
+        if operation == "send" or _should_send_email(message_text):
+            if agent_context is None:
+                await message.reply_text("Draft created, but approval flow is unavailable.")
+                return True
+            question_id = str(uuid4())
+            agent_context.create_pending_request(
+                question_id=question_id,
+                intent="gmail_send",
+                question="Gmail draft is ready. Send it?",
+                category="gmail_send",
+            )
+            _store_gmail_pending_send(
+                context,
+                question_id,
+                {
+                    "draft_id": draft_id,
+                    "to": spec.to,
+                    "subject": spec.subject,
+                    "preview": spec.body[:500],
+                },
+            )
+            preview_text = _build_draft_preview_text(spec)
+            await message.reply_text(
+                f"Draft ready:\n{preview_text}\n\nSend it?",
+                reply_markup=_build_gmail_send_keyboard(),
+            )
+            return True
+        await message.reply_text(f"Gmail draft created: {draft_id}")
+        return True
+
+    if operation in {"inbox", "summary"}:
+        query_hint = None
+        normalized = _normalize_text(message_text)
+        if "today" in normalized:
+            query_hint = "newer_than:1d"
+        if operation == "inbox":
+            await _handle_gmail_inbox(
+                context,
+                message,
+                limit=limit,
+                message_text=message_text,
+                query_hint=query_hint,
+            )
+            return True
+        await _handle_gmail_summary(
+            context,
+            message,
+            limit=limit,
+            message_text=message_text,
+            query_hint=query_hint,
+        )
+        return True
+
+    gmail_query = await asyncio.to_thread(gmail_service.build_search_query, llm_client, query_text)
+    try:
+        results = await asyncio.to_thread(gmail_service.search, gmail_query, max(10, limit))
+    except Exception as exc:
+        logger.warning("Gmail search failed: %s", exc)
+        await message.reply_text("Gmail search failed.")
+        return True
+    if not results:
+        await message.reply_text("No emails matched your request.")
+        return True
+
+    if operation == "count":
+        await message.reply_text(f"Matched emails: {len(results)}")
+        return True
+
+    if operation == "thread_summary":
+        thread_id = results[0].thread_id if results else None
+        thread_messages = await asyncio.to_thread(gmail_service.get_thread_messages, thread_id or "")
+        if not thread_messages:
+            await message.reply_text("Thread not found.")
+            return True
+        summary = await asyncio.to_thread(gmail_service.summarize_messages, llm_client, thread_messages)
+        await message.reply_text(summary)
+        return True
+
+    if operation == "search":
+        lines = [f"Search results ({gmail_query}):"]
+        for mail in results[:limit]:
+            sender = mail.sender or "Unknown sender"
+            subject = mail.subject or "(no subject)"
+            lines.append(f"- {sender} | {subject}")
+        await message.reply_text("\n".join(lines))
+        return True
+
+    items = []
+    for mail in results[:limit]:
+        body = (mail.body or mail.snippet or "").strip()
+        trimmed = body[:1200]
+        items.append(
+            f"- From: {mail.sender}\n"
+            f"  Subject: {mail.subject}\n"
+            f"  Snippet: {mail.snippet or ''}\n"
+            f"  Body: {trimmed}"
+        )
+    if operation == "summary":
+        summary = await asyncio.to_thread(gmail_service.summarize_messages, llm_client, results[:limit])
+        await message.reply_text(summary)
+        return True
+    if operation == "newsletter_digest":
+        prompt = (
+            "Summarize the top 3 newsletter highlights from the emails below. "
+            "Keep it concise in Turkish.\n\n"
+            + "\n\n".join(items)
+        )
+        response = await asyncio.to_thread(llm_client.generate_text, prompt)
+        await message.reply_text(response.strip())
+    elif operation == "extract_tasks":
+        prompt = (
+            "Extract concrete action items (to-do list) from the emails below. "
+            "Return bullet points in Turkish.\n\n"
+            + "\n\n".join(items)
+        )
+        response = await asyncio.to_thread(llm_client.generate_text, prompt)
+        await message.reply_text(response.strip())
+    elif operation == "extract_schedule":
+        prompt = (
+            "Extract meeting times, dates, and locations from the emails below. "
+            "Return a concise list ready to add to a calendar.\n\n"
+            + "\n\n".join(items)
+        )
+        response = await asyncio.to_thread(llm_client.generate_text, prompt)
+        await message.reply_text(response.strip())
+    elif operation == "sentiment":
+        prompt = (
+            "Analyze the tone of the emails below. "
+            "Say if the sender is angry, urgent, or neutral, and why.\n\n"
+            + "\n\n".join(items)
+        )
+        response = await asyncio.to_thread(llm_client.generate_text, prompt)
+        await message.reply_text(response.strip())
+    elif operation == "prioritize":
+        prompt = (
+            "From these emails, pick the top 3 that require action. "
+            "Explain briefly why each needs action.\n\n"
+            + "\n\n".join(items)
+        )
+        response = await asyncio.to_thread(llm_client.generate_text, prompt)
+        await message.reply_text(response.strip())
+    else:
+        question = plan.get("question") or message_text
+        prompt = (
+            "Answer the user's question using the emails below. "
+            "If the question asks for a count, provide the count.\n\n"
+            f"Question: {question}\n\n"
+            + "\n\n".join(items)
+        )
+        response = await asyncio.to_thread(llm_client.generate_text, prompt)
+        await message.reply_text(response.strip())
+
+    post_actions = plan.get("post_actions") or []
+    if post_actions:
+        label_later = getattr(settings, "gmail_later_label", "Later") or "Later"
+        for mail in results[:limit]:
+            if "label_later" in post_actions:
+                await asyncio.to_thread(gmail_service.label_message, mail.message_id, label_later)
+            if "archive" in post_actions:
+                await asyncio.to_thread(gmail_service.archive_message, mail.message_id)
+            if "label_newsletter" in post_actions:
+                await asyncio.to_thread(gmail_service.label_message, mail.message_id, "Newsletter")
+    return True
+
+
 def build_main_keyboard() -> InlineKeyboardMarkup:
     keyboard = [[InlineKeyboardButton(
         text=label, callback_data=value)] for label, value in _BUTTONS]
@@ -413,6 +931,35 @@ def _normalize_command_text(value: str) -> str:
     normalized = _normalize_text(value or "")
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized
+
+
+def _resolve_anonymous_command(normalized: str) -> bool | None:
+    if any(normalized.startswith(token) for token in _ANON_ON_COMMANDS):
+        return True
+    if any(normalized.startswith(token) for token in _ANON_OFF_COMMANDS):
+        return False
+    return None
+
+
+def _store_pending_document(user_id: str, path: str, mime_type: str | None) -> None:
+    _PENDING_DOCUMENTS[user_id] = PendingDocument(
+        path=path,
+        mime_type=mime_type,
+        created_at=time.monotonic(),
+    )
+
+
+def _pop_pending_document(user_id: str | None) -> PendingDocument | None:
+    if not user_id:
+        return None
+    pending = _PENDING_DOCUMENTS.pop(user_id, None)
+    if not pending:
+        return None
+    if time.monotonic() - pending.created_at > _PENDING_DOCUMENT_TTL_SECONDS:
+        return None
+    if not pending.path or not Path(pending.path).exists():
+        return None
+    return pending
 
 
 def _is_clear_history_command(normalized: str) -> bool:
@@ -426,6 +973,16 @@ def _build_clear_history_keyboard() -> InlineKeyboardMarkup:
                 text="YES", callback_data=_CLEAR_HISTORY_CONFIRM_DATA),
             InlineKeyboardButton(
                 text="NO", callback_data=_CLEAR_HISTORY_CANCEL_DATA),
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _build_gmail_send_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            InlineKeyboardButton(text="Yes", callback_data=_GMAIL_SEND_CONFIRM_DATA),
+            InlineKeyboardButton(text="No", callback_data=_GMAIL_SEND_CANCEL_DATA),
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -464,14 +1021,24 @@ def _is_command_list_command(normalized: str) -> bool:
 def _build_command_list_text() -> str:
     return "\n".join(
         (
-            "Kullanilabilir komutlar:",
-            "- clear_history veya /clear_history: sohbet gecmisini temizler.",
-            "- thinking_on / thinking_off: dusunce akisini acar/kapatir.",
-            "- screenshot on / screenshot off: adimlardan sonra ekran goruntusu gonderimini acar/kapatir.",
-            "- job_search: is aramayi baslatir (buton).",
-            "- job_search stop: is aramasini durdurur.",
-            "- stop: tum aksiyonlari durdurur.",
-            "- /pc <gorev> veya pc: <gorev>: PC kontrol gorevi baslatir.",
+            "Available commands:",
+            "- clear_history or /clear_history: clears chat history.",
+            "- thinking_on / thinking_off: toggles thought streaming.",
+            "- screenshot on / screenshot off: toggles post-step screenshots.",
+            "- anonymous on / anonymous off: disables/enables chat logging.",
+            "- /memory: lists stored memory summaries.",
+            "- /forget <id>: deletes the selected memory item.",
+            "- /profile: shows stored profile facts.",
+            "- /profile_forget <id>: deletes the selected profile fact.",
+            "- /gmail_auth: authorizes Gmail access.",
+            "- /inbox [n]: lists unread emails.",
+            "- /summarize_last [n]: summarizes unread emails.",
+            "- /search_mail <query>: searches Gmail.",
+            "- /draft_mail <to> | <subject> | <prompt>: creates a Gmail draft.",
+            "- job_search: starts job search (button).",
+            "- job_search stop: stops job search.",
+            "- stop: stops all actions.",
+            "- /pc <task> or pc: <task>: starts a PC control task.",
         )
     )
 
@@ -544,9 +1111,7 @@ async def _clear_user_history(
     session_context = get_session_context(user_id)
     extra_paths: list[str] = []
     if session_context:
-        last_image_path = session_context.get("last_image_path")
-        if last_image_path:
-            extra_paths.append(str(last_image_path))
+        extra_paths.extend(_collect_recent_image_paths(session_context))
     file_paths = _safe_delete_messages(db, user_id)
     if extra_paths:
         file_paths = list({*file_paths, *extra_paths})
@@ -623,7 +1188,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
     await update.message.reply_text(
-        "ApplyWise bot is online",
+        "Atlas bot is online",
         reply_markup=build_main_keyboard(),
     )
 
@@ -679,6 +1244,21 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             should_reply_to_pending = True
 
     if should_reply_to_pending:
+        if pending.category == "gmail_send":
+            message = query.message
+            if message is not None:
+                handled = await _handle_gmail_send_approval(
+                    context,
+                    message,
+                    agent_context=agent_context,
+                    reply_text=str(query.data or ""),
+                )
+                if handled:
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except Exception as exc:
+                        logger.debug("Failed to clear Gmail send buttons: %s", exc)
+                    return
         # If there's a pending request, treat the button click as a reply to it
         from app.agent.state import HumanReply
 
@@ -700,7 +1280,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if user_id:
             if should_reset_context(user_id, memory_text):
                 clear_session(user_id)
-            record_user_message(user_id, memory_text)
+            if not is_anonymous_mode(user_id):
+                record_user_message(user_id, memory_text)
 
         # We need a message object to reply to. The query.message is the message with the buttons.
         # We can simulate a new message handling or call route_and_handle directly.
@@ -729,6 +1310,22 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     normalized = _normalize_command_text(message.text)
     approval_id = _extract_approval_id_from_reply(message)
     reply_photo = _extract_reply_photo(message)
+    reply_doc = None
+    reply_msg = getattr(message, "reply_to_message", None)
+    if reply_msg is not None:
+        reply_doc = getattr(reply_msg, "document", None)
+        if reply_doc is not None and (getattr(reply_doc, "mime_type", "") or "").startswith("image/"):
+            reply_doc = None
+
+    anon_action = _resolve_anonymous_command(normalized)
+    if anon_action is not None:
+        if user_id:
+            set_anonymous_mode(user_id, anon_action)
+            status = "enabled" if anon_action else "disabled"
+            await message.reply_text(f"Anonymous mode {status}.")
+        else:
+            await message.reply_text("Anonymous mode requires a user id.")
+        return
 
     if not approval_id:
         if _is_clear_history_command(normalized):
@@ -760,7 +1357,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if user_id:
         if should_reset_context(user_id, memory_text):
             clear_session(user_id)
-        record_user_message(user_id, memory_text)
+        if not is_anonymous_mode(user_id):
+            record_user_message(user_id, memory_text)
 
     agent_context = context.application.bot_data.get("agent_context")
     if agent_context is None:
@@ -782,10 +1380,43 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     pending = agent_context.pending_request
+    if pending is not None and pending.category == "gmail_send":
+        handled = await _handle_gmail_send_approval(
+            context,
+            message,
+            agent_context=agent_context,
+            reply_text=message.text,
+        )
+        if handled:
+            return
     if pending is not None and pending.category != "startup":
         handled = await _handle_pending_reply(message, agent_context, message.text)
         if handled:
             return
+
+    if reply_doc is not None:
+        await _handle_document_request(
+            message=message,
+            context=context,
+            caption=message.text,
+            document=reply_doc,
+            user_id=user_id,
+            session_context=get_session_context(user_id),
+        )
+        return
+
+    pending_doc = _pop_pending_document(user_id)
+    if pending_doc is not None:
+        await _handle_document_request_from_path(
+            message=message,
+            context=context,
+            caption=message.text,
+            file_path=pending_doc.path,
+            mime_type=pending_doc.mime_type,
+            user_id=user_id,
+            session_context=get_session_context(user_id),
+        )
+        return
 
     await _route_and_handle_message(
         update=update,
@@ -817,7 +1448,8 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if user_id:
             if should_reset_context(user_id, memory_text):
                 clear_session(user_id)
-            record_user_message(user_id, memory_text)
+            if not is_anonymous_mode(user_id):
+                record_user_message(user_id, memory_text)
 
     agent_context = context.application.bot_data.get("agent_context")
     if agent_context is None:
@@ -851,12 +1483,42 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         return
     user_id = _resolve_user_id(update)
     caption = message.caption or ""
+    if not caption.strip() and user_id:
+        document_size = getattr(document, "file_size", None)
+        if document_size and document_size > GEMINI_FLASH_MAX_DOCUMENT_BYTES:
+            await message.reply_text(
+                _file_too_large_message(
+                    "Document", GEMINI_FLASH_MAX_DOCUMENT_BYTES)
+            )
+            return
+        try:
+            temp_path = await _download_document_to_temp(document, message)
+        except Exception as exc:  # pragma: no cover - network/IO errors
+            logger.error("Document download failed: %s", exc)
+            await message.reply_text("Document download failed. Please try again.")
+            return
+        if document_size is None and temp_path:
+            try:
+                downloaded_size = Path(temp_path).stat().st_size
+            except Exception as exc:
+                logger.warning("Document size check failed: %s", exc)
+                downloaded_size = None
+            if downloaded_size and downloaded_size > GEMINI_FLASH_MAX_DOCUMENT_BYTES:
+                await message.reply_text(
+                    _file_too_large_message(
+                        "Document", GEMINI_FLASH_MAX_DOCUMENT_BYTES)
+                )
+                return
+        _store_pending_document(user_id, temp_path, getattr(document, "mime_type", None))
+        await message.reply_text("Please add a caption describing what to do with the file.")
+        return
     if caption:
         memory_text = _memory_text(caption)
         if user_id:
             if should_reset_context(user_id, memory_text):
                 clear_session(user_id)
-            record_user_message(user_id, memory_text)
+            if not is_anonymous_mode(user_id):
+                record_user_message(user_id, memory_text)
 
     agent_context = context.application.bot_data.get("agent_context")
     if agent_context is None:
@@ -897,7 +1559,8 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if user_id:
             if should_reset_context(user_id, memory_text):
                 clear_session(user_id)
-            record_user_message(user_id, memory_text)
+            if not is_anonymous_mode(user_id):
+                record_user_message(user_id, memory_text)
 
     agent_context = context.application.bot_data.get("agent_context")
     if agent_context is None:
@@ -939,7 +1602,8 @@ async def handle_pc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if user_id:
         if should_reset_context(user_id, memory_text):
             clear_session(user_id)
-        record_user_message(user_id, memory_text)
+        if not is_anonymous_mode(user_id):
+            record_user_message(user_id, memory_text)
     agent_context = context.application.bot_data.get("agent_context")
     if agent_context is None:
         await message.reply_text("Agent is not ready. Please try again later.")
@@ -955,6 +1619,497 @@ async def handle_pc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         photo=None,
         pending=pending,
     )
+
+
+async def handle_memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None:
+        return
+    user_id = _resolve_user_id(update)
+    if not user_id:
+        await message.reply_text("No user id available for memory lookup.")
+        return
+    db = get_database()
+    items = db.get_memory_items(user_id, limit=10)
+    if not items:
+        await message.reply_text("No memory items found.")
+        return
+    lines = ["Memory items:"]
+    for item in items:
+        date_label = _format_memory_date(item.created_at)
+        title = item.title or "Memory"
+        lines.append(f"- {item.id}: {title} ({date_label})")
+    await message.reply_text("\n".join(lines))
+
+
+async def handle_forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or not message.text:
+        return
+    user_id = _resolve_user_id(update)
+    if not user_id:
+        await message.reply_text("No user id available for memory deletion.")
+        return
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply_text("Usage: /forget <memory_id>")
+        return
+    try:
+        memory_id = int(parts[1])
+    except ValueError:
+        await message.reply_text("Memory id must be a number.")
+        return
+    db = get_database()
+    deleted = db.delete_memory_item(user_id, memory_id)
+    if deleted:
+        await message.reply_text(f"Memory item {memory_id} deleted.")
+    else:
+        await message.reply_text("Memory item not found.")
+
+
+async def handle_profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None:
+        return
+    user_id = _resolve_user_id(update)
+    if not user_id:
+        await message.reply_text("No user id available for profile lookup.")
+        return
+    db = get_database()
+    profile_json = db.get_user_profile(user_id)
+    if not profile_json:
+        await message.reply_text("No profile details stored yet.")
+        return
+    migrated_json, migrated = migrate_profile_json(profile_json)
+    if migrated:
+        profile_json = migrated_json
+        db.set_user_profile(user_id, profile_json)
+    try:
+        profile = json.loads(profile_json)
+    except Exception:
+        await message.reply_text("Profile data is not readable.")
+        return
+    facts = profile.get("facts") if isinstance(profile, dict) else None
+    if not isinstance(facts, list) or not facts:
+        await message.reply_text("No profile details stored yet.")
+        return
+    lines = ["Profile facts:"]
+    for item in facts[:20]:
+        if not isinstance(item, dict):
+            continue
+        fact_id = str(item.get("id") or "").strip()
+        key = str(item.get("key") or "").strip()
+        value = str(item.get("value") or "").strip()
+        if not fact_id or not key or not value:
+            continue
+        lines.append(f"- {fact_id}: {key} = {value}")
+    await message.reply_text("\n".join(lines))
+
+
+async def handle_profile_forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or not message.text:
+        return
+    user_id = _resolve_user_id(update)
+    if not user_id:
+        await message.reply_text("No user id available for profile updates.")
+        return
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply_text("Usage: /profile_forget <id>")
+        return
+    target_id = parts[1].strip()
+    db = get_database()
+    profile_json = db.get_user_profile(user_id)
+    if not profile_json:
+        await message.reply_text("No profile details stored yet.")
+        return
+    migrated_json, migrated = migrate_profile_json(profile_json)
+    if migrated:
+        profile_json = migrated_json
+        db.set_user_profile(user_id, profile_json)
+    try:
+        profile = json.loads(profile_json)
+    except Exception:
+        await message.reply_text("Profile data is not readable.")
+        return
+    if not isinstance(profile, dict):
+        await message.reply_text("Profile data is not valid.")
+        return
+    facts = profile.get("facts")
+    if not isinstance(facts, list) or not facts:
+        await message.reply_text("No profile details stored yet.")
+        return
+    remaining = []
+    deleted = False
+    for item in facts:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("id") or "").strip() == target_id:
+            deleted = True
+            continue
+        remaining.append(item)
+    if not deleted:
+        await message.reply_text("Profile item not found.")
+        return
+    profile["facts"] = remaining
+    db.set_user_profile(user_id, json.dumps(profile, ensure_ascii=True))
+    await message.reply_text(f"Profile item deleted: {target_id}")
+
+
+async def _handle_gmail_inbox(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    *,
+    limit: int,
+    message_text: str,
+    query_hint: str | None = None,
+) -> None:
+    await _maybe_send_gmail_status(context, message, "Gmail: scanning inbox...")
+    try:
+        gmail_service = _get_gmail_service(context)
+    except Exception as exc:
+        logger.warning("Gmail service unavailable: %s", exc)
+        await message.reply_text("Gmail service is not configured.")
+        return
+    llm_client = context.application.bot_data.get("llm_client")
+    if query_hint is None:
+        normalized = _normalize_text(message_text)
+        if "today" in normalized:
+            query_hint = "newer_than:1d"
+    try:
+        messages = await asyncio.to_thread(gmail_service.list_unread, limit, query_hint)
+    except Exception as exc:
+        logger.warning("Gmail inbox fetch failed: %s", exc)
+        await message.reply_text("Failed to fetch Gmail inbox.")
+        return
+    if not messages:
+        await message.reply_text("No unread emails found.")
+        return
+    lines = ["Unread emails:"]
+    for mail in messages:
+        label = "Action Required"
+        if llm_client is not None:
+            label = await asyncio.to_thread(gmail_service.categorize_message, llm_client, mail)
+        sender = mail.sender or "Unknown sender"
+        subject = mail.subject or "(no subject)"
+        lines.append(f"- [{label}] {sender} | {subject}")
+        if label in GMAIL_LABELS:
+            try:
+                await asyncio.to_thread(gmail_service.label_message, mail.message_id, label)
+            except Exception as exc:
+                logger.warning("Gmail label apply failed: %s", exc)
+    await message.reply_text("\n".join(lines))
+
+
+async def _handle_gmail_summary(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    *,
+    limit: int,
+    message_text: str,
+    query_hint: str | None = None,
+) -> None:
+    await _maybe_send_gmail_status(context, message, "Gmail: preparing summary...")
+    llm_client = context.application.bot_data.get("llm_client")
+    if llm_client is None:
+        await message.reply_text("LLM is not configured for summaries.")
+        return
+    try:
+        gmail_service = _get_gmail_service(context)
+        messages = await asyncio.to_thread(gmail_service.list_unread, limit, query_hint)
+    except Exception as exc:
+        logger.warning("Gmail summary fetch failed: %s", exc)
+        await message.reply_text("Failed to fetch Gmail inbox.")
+        return
+    if not messages:
+        await message.reply_text("No unread emails found.")
+        return
+    summary = await asyncio.to_thread(gmail_service.summarize_messages, llm_client, messages)
+    await message.reply_text(summary)
+
+
+async def _handle_gmail_search(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    *,
+    query_text: str,
+) -> None:
+    await _maybe_send_gmail_status(context, message, "Gmail: searching mail...")
+    llm_client = context.application.bot_data.get("llm_client")
+    try:
+        gmail_service = _get_gmail_service(context)
+    except Exception as exc:
+        logger.warning("Gmail service unavailable: %s", exc)
+        await message.reply_text("Gmail service is not configured.")
+        return
+    gmail_query = query_text
+    if llm_client is not None:
+        gmail_query = await asyncio.to_thread(
+            gmail_service.build_search_query, llm_client, query_text
+        )
+    try:
+        results = await asyncio.to_thread(gmail_service.search, gmail_query, 15)
+    except Exception as exc:
+        logger.warning("Gmail search failed: %s", exc)
+        await message.reply_text("Gmail search failed.")
+        return
+    if not results:
+        await message.reply_text("No emails matched your search.")
+        return
+    lines = [f"Search results ({gmail_query}):"]
+    for mail in results:
+        sender = mail.sender or "Unknown sender"
+        subject = mail.subject or "(no subject)"
+        lines.append(f"- {sender} | {subject}")
+    await message.reply_text("\n".join(lines))
+
+
+async def _handle_gmail_question(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    *,
+    question_text: str,
+) -> None:
+    await _maybe_send_gmail_status(context, message, "Gmail: analyzing messages...")
+    llm_client = context.application.bot_data.get("llm_client")
+    if llm_client is None:
+        await message.reply_text("LLM is not configured for Gmail questions.")
+        return
+    try:
+        gmail_service = _get_gmail_service(context)
+    except Exception as exc:
+        logger.warning("Gmail service unavailable: %s", exc)
+        await message.reply_text("Gmail service is not configured.")
+        return
+    gmail_query = await asyncio.to_thread(
+        gmail_service.build_search_query, llm_client, question_text
+    )
+    try:
+        results = await asyncio.to_thread(gmail_service.search, gmail_query, 25)
+    except Exception as exc:
+        logger.warning("Gmail question search failed: %s", exc)
+        await message.reply_text("Gmail search failed.")
+        return
+    if not results:
+        await message.reply_text("No emails matched your request.")
+        return
+    items = []
+    for mail in results:
+        body = (mail.body or mail.snippet or "").strip()
+        trimmed = body[:1200]
+        items.append(
+            f"- From: {mail.sender}\n"
+            f"  Subject: {mail.subject}\n"
+            f"  Snippet: {mail.snippet or ''}\n"
+            f"  Body: {trimmed}"
+        )
+    prompt = (
+        "Answer the user's question using the emails below. "
+        "If the question asks for a count, provide the count. "
+        "If you cannot find an answer, say so.\n\n"
+        f"Question: {question_text}\n\n"
+        + "\n\n".join(items)
+    )
+    response = await asyncio.to_thread(llm_client.generate_text, prompt)
+    await message.reply_text(response.strip())
+
+
+async def _handle_gmail_draft(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    *,
+    request_text: str,
+) -> None:
+    await _maybe_send_gmail_status(context, message, "Gmail: drafting email...")
+    llm_client = context.application.bot_data.get("llm_client")
+    user_id = _resolve_user_id_from_message(message)
+    try:
+        gmail_service = _get_gmail_service(context)
+    except Exception as exc:
+        logger.warning("Gmail service unavailable: %s", exc)
+        await message.reply_text("Gmail service is not configured.")
+        return
+    details = _extract_draft_request(llm_client, request_text)
+    if details.get("needs_clarification"):
+        await message.reply_text(details.get("clarification_question"))
+        return
+    recipient = details.get("to") or _extract_first_email(request_text)
+    if not recipient:
+        await message.reply_text("Who should I send it to? Please provide an email address.")
+        return
+    prompt = details.get("prompt") or request_text
+    try:
+        if llm_client is not None:
+            spec = await asyncio.to_thread(
+                gmail_service.build_draft_from_prompt, llm_client, recipient, prompt
+            )
+        else:
+            spec = DraftSpec(to=recipient, subject=details.get("subject") or "Quick Update", body=prompt)
+        if details.get("subject"):
+            spec = DraftSpec(to=spec.to, subject=details["subject"], body=spec.body)
+        signature_name = _extract_signature_name(user_id)
+        spec = _apply_signature(spec, signature_name)
+        draft_id = await asyncio.to_thread(gmail_service.create_draft, spec)
+    except Exception as exc:
+        logger.warning("Gmail draft failed: %s", exc)
+        await message.reply_text("Failed to create Gmail draft.")
+        return
+    if _should_send_email(request_text):
+        agent_context = context.application.bot_data.get("agent_context")
+        if agent_context is None:
+            await message.reply_text("Draft created, but approval flow is unavailable.")
+            return
+        question_id = str(uuid4())
+        agent_context.create_pending_request(
+            question_id=question_id,
+            intent="gmail_send",
+            question="Gmail draft is ready. Send it?",
+            category="gmail_send",
+        )
+        _store_gmail_pending_send(
+            context,
+            question_id,
+            {
+                "draft_id": draft_id,
+                "to": spec.to,
+                "subject": spec.subject,
+                "preview": spec.body[:500],
+            },
+        )
+        preview_text = _build_draft_preview_text(spec)
+        await message.reply_text(
+            f"Draft ready:\n{preview_text}\n\nSend it?",
+            reply_markup=_build_gmail_send_keyboard(),
+        )
+        return
+    await message.reply_text(f"Gmail draft created: {draft_id}")
+
+
+async def _handle_gmail_send_approval(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    *,
+    agent_context,
+    reply_text: str,
+) -> bool:
+    pending = agent_context.pending_request
+    if pending is None or pending.category != "gmail_send":
+        return False
+    if reply_text in {_GMAIL_SEND_CONFIRM_DATA, _GMAIL_SEND_CANCEL_DATA}:
+        normalized = reply_text
+    else:
+        normalized = _normalize_text(reply_text)
+    if normalized == _GMAIL_SEND_CONFIRM_DATA or any(
+        token in normalized for token in _GMAIL_APPROVE_TOKENS
+    ):
+        pending_payload = _pop_gmail_pending_send(context, pending.question_id)
+        if not pending_payload:
+            agent_context.pending_request = None
+            await message.reply_text("Pending Gmail draft not found.")
+            return True
+        try:
+            gmail_service = _get_gmail_service(context)
+            sent_id = await asyncio.to_thread(
+                gmail_service.send_draft, pending_payload.get("draft_id", "")
+            )
+        except Exception as exc:
+            logger.warning("Gmail send failed: %s", exc)
+            await message.reply_text(
+                "Failed to send email. You may need to re-authenticate Gmail with send permissions."
+            )
+            agent_context.pending_request = None
+            return True
+        agent_context.pending_request = None
+        await message.reply_text(f"Email sent. Message id: {sent_id}")
+        return True
+    if normalized == _GMAIL_SEND_CANCEL_DATA or any(
+        token in normalized for token in _GMAIL_REJECT_TOKENS
+    ):
+        _pop_gmail_pending_send(context, pending.question_id)
+        agent_context.pending_request = None
+        await message.reply_text("Email send canceled.")
+        return True
+    await message.reply_text("Please reply with Yes or No.")
+    return True
+
+
+async def handle_gmail_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None:
+        return
+    settings = _resolve_settings(context)
+    if not getattr(settings, "gmail_credentials_path", ""):
+        await message.reply_text("Set GMAIL_OAUTH_CREDENTIALS_PATH to your OAuth JSON first.")
+        return
+    try:
+        gmail_service = _get_gmail_service(context)
+        await asyncio.to_thread(gmail_service.ensure_credentials)
+    except Exception as exc:
+        logger.warning("Gmail auth failed: %s", exc)
+        await message.reply_text("Gmail authentication failed. Check logs for details.")
+        return
+    await message.reply_text("Gmail authentication completed.")
+
+
+async def handle_inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or not message.text:
+        return
+    parts = message.text.split(maxsplit=1)
+    limit = _parse_limit_arg(parts[1] if len(parts) > 1 else None, default=5, max_value=20)
+    await _handle_gmail_inbox(context, message, limit=limit, message_text=message.text)
+
+
+async def handle_summarize_last_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or not message.text:
+        return
+    parts = message.text.split(maxsplit=1)
+    limit = _parse_limit_arg(parts[1] if len(parts) > 1 else None, default=5, max_value=15)
+    await _handle_gmail_summary(context, message, limit=limit, message_text=message.text)
+
+
+async def handle_search_mail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or not message.text:
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply_text("Usage: /search_mail <query>")
+        return
+    query_text = parts[1].strip()
+    if not query_text:
+        await message.reply_text("Usage: /search_mail <query>")
+        return
+    await _handle_gmail_search(context, message, query_text=query_text)
+
+
+async def handle_draft_mail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or not message.text:
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply_text("Usage: /draft_mail <to> | <subject> | <prompt>")
+        return
+    payload = parts[1].strip()
+    recipient = ""
+    subject_override = ""
+    prompt = ""
+    if "|" in payload:
+        segments = [item.strip() for item in payload.split("|")]
+        recipient = segments[0] if len(segments) > 0 else ""
+        subject_override = segments[1] if len(segments) > 1 else ""
+        prompt = segments[2] if len(segments) > 2 else ""
+    else:
+        tokens = payload.split(maxsplit=1)
+        recipient = tokens[0] if tokens else ""
+        prompt = tokens[1] if len(tokens) > 1 else ""
+    if not recipient or not prompt:
+        await message.reply_text("Usage: /draft_mail <to> | <subject> | <prompt>")
+        return
+    await _handle_gmail_draft(context, message, request_text=message.text)
 
 
 async def _route_and_handle_message(
@@ -993,7 +2148,7 @@ async def _route_and_handle_message(
     if (
         not has_image
         and session_context
-        and session_context.get("last_image_path")
+        and _has_recent_images(session_context)
         and await _is_analysis_request_with_llm(llm_client, message_text)
         and _mentions_explicit_image_reference(message_text)
     ):
@@ -1040,6 +2195,56 @@ async def _route_and_handle_message(
             settings=settings,
             telegram_app=context.application,
         )
+        return
+    if decision.intent == RouterIntent.GMAIL_INBOX:
+        handled = await _handle_gmail_intelligent_request(
+            context, message, intent=decision.intent, message_text=message_text
+        )
+        if handled:
+            return
+        limit = _extract_limit_from_text(message_text, default=5, max_value=20)
+        await _handle_gmail_inbox(context, message, limit=limit, message_text=message_text)
+        return
+    if decision.intent == RouterIntent.GMAIL_SUMMARY:
+        handled = await _handle_gmail_intelligent_request(
+            context, message, intent=decision.intent, message_text=message_text
+        )
+        if handled:
+            return
+        limit = _extract_limit_from_text(message_text, default=5, max_value=15)
+        await _handle_gmail_summary(context, message, limit=limit, message_text=message_text)
+        return
+    if decision.intent == RouterIntent.GMAIL_SEARCH:
+        handled = await _handle_gmail_intelligent_request(
+            context, message, intent=decision.intent, message_text=message_text
+        )
+        if handled:
+            return
+        await _handle_gmail_search(context, message, query_text=message_text)
+        return
+    if decision.intent == RouterIntent.GMAIL_QUESTION:
+        handled = await _handle_gmail_intelligent_request(
+            context, message, intent=decision.intent, message_text=message_text
+        )
+        if handled:
+            return
+        await _handle_gmail_question(context, message, question_text=message_text)
+        return
+    if decision.intent == RouterIntent.GMAIL_DRAFT:
+        handled = await _handle_gmail_intelligent_request(
+            context, message, intent=decision.intent, message_text=message_text
+        )
+        if handled:
+            return
+        await _handle_gmail_draft(context, message, request_text=message_text)
+        return
+    if decision.intent == RouterIntent.GMAIL_SEND:
+        handled = await _handle_gmail_intelligent_request(
+            context, message, intent=decision.intent, message_text=message_text
+        )
+        if handled:
+            return
+        await _handle_gmail_draft(context, message, request_text=message_text)
         return
 
     await _handle_chat(
@@ -1296,10 +2501,28 @@ async def _handle_chat(
         )
         return
     db = get_database() if user_id else None
+    anon_enabled = bool(user_id and is_anonymous_mode(user_id))
     history = _safe_get_history(
         db, user_id, _CHAT_CONTEXT_LIMIT) if db and user_id else []
     timestamp = _timestamp_from_message(message)
-    prompt = _build_chat_prompt(llm_prompt_text, history)
+    memory_manager = None
+    memory_block = ""
+    profile_block = ""
+    memory_item_ids: list[int] = []
+    should_summarize = False
+    if db and user_id:
+        memory_manager = _get_memory_manager(telegram_app, settings)
+        if memory_manager.enabled and not anon_enabled:
+            profile_block = memory_manager.build_profile_snippet(db.get_user_profile(user_id))
+            items = db.get_memory_items(user_id, limit=500)
+            memory_block, memory_item_ids = memory_manager.retrieve_memory_block(
+                items,
+                prompt_text,
+            )
+            if memory_item_ids:
+                db.update_memory_last_used(memory_item_ids)
+            should_summarize = memory_manager.record_user_message(user_id)
+    prompt = _build_chat_prompt(llm_prompt_text, history, profile_block, memory_block)
     if db and user_id:
         _safe_add_message(
             db,
@@ -1309,12 +2532,45 @@ async def _handle_chat(
             timestamp=timestamp,
             **_user_source_kwargs(message, source_meta),
         )
+
+    def _schedule_memory_updates() -> None:
+        if (
+            not memory_manager
+            or not memory_manager.enabled
+            or anon_enabled
+            or not db
+            or not user_id
+        ):
+            return
+
+        def _runner() -> None:
+            if should_summarize:
+                success = memory_manager.summarize_and_store(
+                    db=db,
+                    llm_client=llm_client,
+                    user_key=user_id,
+                    chat_id=str(message.chat_id),
+                    history_limit=memory_manager.summary_window,
+                )
+                if success:
+                    memory_manager.reset_user_counter(user_id)
+            memory_manager.maybe_update_profile(
+                db=db,
+                llm_client=llm_client,
+                user_key=user_id,
+                message_text=prompt_text,
+            )
+
+        async def _async_runner() -> None:
+            await asyncio.to_thread(_runner)
+
+        telegram_app.create_task(_async_runner())
     streaming_enabled = bool(getattr(settings, "streaming_enabled", False))
     show_thoughts = bool(getattr(settings, "show_thoughts", True))
     if streaming_enabled and hasattr(llm_client, "stream_text"):
         async def _stream_runner() -> None:
             try:
-                live_message = await message.reply_text("⏳ Thinking...", parse_mode=ParseMode.HTML)
+                live_message = await message.reply_text("Thinking...", parse_mode=ParseMode.HTML)
                 manager = MessageManager(
                     bot=telegram_app.bot,
                     chat_id=str(message.chat_id),
@@ -1349,7 +2605,7 @@ async def _handle_chat(
                     if result.error is None:
                         break
                     if attempt < _STREAM_RETRY_ATTEMPTS:
-                        await manager.update("⏳ Retrying...", force=True)
+                        await manager.update("Retrying...", force=True)
                         await asyncio.sleep(_retry_delay(attempt, _STREAM_RETRY_BASE_DELAY, _STREAM_RETRY_MAX_DELAY))
                 if handler is None or result is None:
                     raise RuntimeError("Streaming did not produce a result.")
@@ -1396,6 +2652,7 @@ async def _handle_chat(
                         await manager.finalize(final_message, reply_markup=reply_markup)
                         _safe_update_message_source(
                             db, assistant_row_id, live_message)
+                    _schedule_memory_updates()
                 else:
                     await manager.finalize(handler.format_message(include_thoughts=False))
                 if not response_text and not handler.thought_text:
@@ -1452,6 +2709,7 @@ async def _handle_chat(
         history_text=suggestion_context,
     )
     _safe_update_message_source(db, assistant_row_id, sent_message)
+    _schedule_memory_updates()
 
 
 async def _handle_image_generation(
@@ -1529,7 +2787,7 @@ async def _handle_image_generation(
 
             try:
                 live_message = await message.reply_text(
-                    "⏳ Generating image...",
+                    "Generating image...",
                     parse_mode=ParseMode.HTML,
                 )
                 manager = MessageManager(
@@ -1557,7 +2815,7 @@ async def _handle_image_generation(
                     last_error = result.error or ValueError(
                         "No image bytes received from stream.")
                     if attempt < _STREAM_RETRY_ATTEMPTS:
-                        await manager.update("⏳ Retrying...", force=True)
+                        await manager.update("Retrying...", force=True)
                         await asyncio.sleep(_retry_delay(attempt, _STREAM_RETRY_BASE_DELAY, _STREAM_RETRY_MAX_DELAY))
                 if handler is None:
                     raise RuntimeError("Stream did not initialize.")
@@ -1689,8 +2947,14 @@ async def _handle_image_edit(
             source="uploaded",
         )
     else:
-        reference_path = session_context.get(
-            "last_image_path") if session_context else None
+        reference_path, _, ambiguous = _resolve_image_reference(
+            prompt_text, session_context
+        )
+        if ambiguous:
+            await message.reply_text(
+                _build_image_disambiguation_message(session_context)
+            )
+            return
         if not reference_path or not Path(reference_path).exists():
             await message.reply_text("Please send the image you want to edit.")
             return
@@ -1726,7 +2990,7 @@ async def _handle_image_edit(
             async def _stream_runner() -> None:
                 try:
                     live_message = await message.reply_text(
-                        "⏳ Analyzing image...",
+                        "Analyzing image...",
                         parse_mode=ParseMode.HTML,
                     )
                     manager = MessageManager(
@@ -1885,7 +3149,7 @@ async def _handle_image_edit(
         async def _stream_runner() -> None:
             try:
                 live_message = await message.reply_text(
-                    "⏳ Editing image...",
+                    "Editing image...",
                     parse_mode=ParseMode.HTML,
                 )
                 manager = MessageManager(
@@ -1914,7 +3178,7 @@ async def _handle_image_edit(
                     last_error = result.error or ValueError(
                         "No image bytes received from stream.")
                     if attempt < _STREAM_RETRY_ATTEMPTS:
-                        await manager.update("⏳ Retrying...", force=True)
+                        await manager.update("Retrying...", force=True)
                         await asyncio.sleep(_retry_delay(attempt, _STREAM_RETRY_BASE_DELAY, _STREAM_RETRY_MAX_DELAY))
                 if handler is None:
                     raise RuntimeError("Stream did not initialize.")
@@ -2038,6 +3302,82 @@ async def _handle_document_request(
         llm_client.generate_with_file,
         llm_prompt_text,
         temp_path,
+        mime_type,
+    )
+    if result.error:
+        await message.reply_text(result.error)
+        return
+    if not result.text:
+        await message.reply_text("No response generated for the document.")
+        return
+    assistant_row_id = None
+    if db and user_id:
+        assistant_row_id = _safe_add_message(
+            db,
+            user_id=user_id,
+            role="assistant",
+            content=result.text,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+    suggestion_context = _build_suggestion_context(
+        user_id=user_id,
+        db=db,
+        session_context=session_context,
+        user_message=caption_text,
+        assistant_message=result.text,
+        task_type="document",
+        extra_context="User asked to process a document.",
+    )
+    reply_markup = await _build_suggestion_markup(llm_client, suggestion_context)
+    sent_message = await _send_text_in_chunks(
+        message,
+        result.text,
+        chunk_size=3500,
+        reply_markup=reply_markup,
+    )
+    _safe_update_message_source(db, assistant_row_id, sent_message)
+
+
+async def _handle_document_request_from_path(
+    *,
+    message,
+    context,
+    caption: str,
+    file_path: str,
+    mime_type: str | None,
+    user_id: str | None,
+    session_context: dict | None,
+    source_meta: dict[str, str | None] | None = None,
+) -> None:
+    caption_text = caption.strip()
+    if not caption_text:
+        await message.reply_text("Please add a caption describing what to do with the file.")
+        return
+    llm_client = context.application.bot_data.get("llm_client")
+    if llm_client is None:
+        await message.reply_text("Gemini is not configured. Please set GEMINI_API_KEY.")
+        return
+    if not file_path or not Path(file_path).exists():
+        await message.reply_text("I can't find the file anymore. Please re-send it.")
+        return
+    reply_note = _build_reply_context_note(message, user_id)
+    llm_prompt_text = _inject_reply_context(caption_text, reply_note)
+    db = get_database() if user_id else None
+    if db and user_id:
+        _safe_add_message(
+            db,
+            user_id=user_id,
+            role="user",
+            content=caption_text,
+            timestamp=_timestamp_from_message(message),
+            file_path=file_path,
+            file_type=mime_type,
+            **_user_source_kwargs(message, source_meta),
+        )
+    result = await asyncio.to_thread(
+        llm_client.generate_with_file,
+        llm_prompt_text,
+        file_path,
         mime_type,
     )
     if result.error:
@@ -2338,6 +3678,19 @@ def _timestamp_from_message(message) -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _format_memory_date(value: str | None) -> str:
+    if not value:
+        return "unknown"
+    cleaned = value.strip()
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return "unknown"
+    return parsed.date().isoformat()
+
+
 def _safe_get_history(db, user_id: str, limit: int):
     try:
         return db.get_recent_messages(user_id, limit)
@@ -2347,6 +3700,9 @@ def _safe_get_history(db, user_id: str, limit: int):
 
 
 def _safe_add_message(db, **kwargs) -> int | None:
+    user_id = kwargs.get("user_id")
+    if user_id and is_anonymous_mode(str(user_id)):
+        return None
     message = kwargs.pop("message", None)
     if message is not None:
         role = kwargs.get("role")
@@ -2386,14 +3742,27 @@ def _safe_update_message_source(db, message_row_id: int | None, message) -> None
         logger.warning("Message source update failed: %s", exc)
 
 
-def _build_chat_prompt(prompt_text: str, history: list) -> str:
-    if not history:
-        return prompt_text
-    lines = [_format_history_line(entry) for entry in reversed(history)]
-    history_block = "\n".join(line for line in lines if line)
-    if not history_block:
-        return prompt_text
-    return f"Conversation so far:\n{history_block}\n\nUser: {prompt_text}"
+def _build_chat_prompt(
+    prompt_text: str,
+    history: list,
+    profile_block: str = "",
+    memory_block: str = "",
+) -> str:
+    parts: list[str] = []
+    if profile_block:
+        parts.append(f"User profile:\n{profile_block}")
+    if memory_block:
+        parts.append(memory_block)
+    history_block = ""
+    if history:
+        lines = [_format_history_line(entry) for entry in reversed(history)]
+        history_block = "\n".join(line for line in lines if line)
+    if history_block:
+        parts.append(f"Conversation so far:\n{history_block}")
+    if parts:
+        parts.append(f"User: {prompt_text}")
+        return "\n\n".join(parts)
+    return prompt_text
 
 
 def _format_history_line(entry) -> str:
@@ -2457,6 +3826,13 @@ def _format_session_context(session_context: dict | None) -> list[str]:
         joined = " | ".join(str(item) for item in short_term_memory if item)
         if joined:
             lines.append(f"- session_history: {joined}")
+    recent_images = _get_recent_images(session_context)
+    if recent_images:
+        summary = _format_recent_image_summary(recent_images[-1])
+        lines.append(
+            f"- recent_images: {len(recent_images)}"
+            + (f" (latest: {summary})" if summary else "")
+        )
     return lines
 
 
@@ -3077,19 +4453,180 @@ async def _build_suggestion_markup(llm_client, history_text: str | None) -> Inli
         return None
 
 
+def _get_recent_images(session_context: dict | None) -> list[dict]:
+    if not session_context:
+        return []
+    recent = session_context.get("recent_images")
+    images = []
+    if isinstance(recent, list):
+        for item in recent:
+            if not isinstance(item, dict):
+                continue
+            if not item.get("path"):
+                continue
+            images.append(item)
+    if images:
+        return images
+    last_path = session_context.get("last_image_path")
+    if last_path:
+        return [
+            {
+                "path": last_path,
+                "prompt": session_context.get("last_image_prompt"),
+                "summary": session_context.get("last_image_summary"),
+                "source": session_context.get("last_image_source"),
+            }
+        ]
+    return []
+
+
+def _has_recent_images(session_context: dict | None) -> bool:
+    return bool(_get_recent_images(session_context))
+
+
+def _collect_recent_image_paths(session_context: dict | None) -> list[str]:
+    images = _get_recent_images(session_context)
+    return [str(item["path"]) for item in images if item.get("path")]
+
+
+def _format_recent_image_summary(image: dict) -> str:
+    summary = image.get("summary") or image.get("prompt") or image.get("source") or ""
+    summary = str(summary).replace("\n", " ").strip()
+    if not summary:
+        return ""
+    if len(summary) <= 80:
+        return summary
+    return f"{summary[:77].rstrip()}..."
+
+
+def _resolve_image_reference(
+    message_text: str,
+    session_context: dict | None,
+) -> tuple[str | None, str | None, bool]:
+    images = _get_recent_images(session_context)
+    if not images:
+        return None, None, False
+    normalized = _normalize_text(message_text or "")
+    index = _extract_image_reference_index(normalized)
+    if index is not None:
+        selected = _select_image_by_recency(images, index)
+        if selected:
+            return selected.get("path"), selected.get("summary"), False
+    if _mentions_first_image(normalized):
+        selected = images[0]
+        return selected.get("path"), selected.get("summary"), False
+    if _mentions_previous_image(normalized):
+        selected = _select_image_by_recency(images, 2) or images[-1]
+        return selected.get("path"), selected.get("summary"), False
+    if _mentions_last_image(normalized):
+        selected = images[-1]
+        return selected.get("path"), selected.get("summary"), False
+    if len(images) > 1 and _is_ambiguous_image_request(normalized):
+        return None, None, True
+    selected = images[-1]
+    return selected.get("path"), selected.get("summary"), False
+
+
+def _select_image_by_recency(images: list[dict], index: int) -> dict | None:
+    if index <= 0:
+        return None
+    if index > len(images):
+        return None
+    return images[-index]
+
+
+def _extract_image_reference_index(text: str) -> int | None:
+    match = re.search(r"\b(\d+)\s+(?:previous|back|onceki)\b", text)
+    if match:
+        return int(match.group(1)) + 1
+    match = re.search(r"\b(\d+)\s*(?:image|photo|picture)\b", text)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"\b(?:image|photo|picture)\s*(\d+)\b", text)
+    if match:
+        return int(match.group(1))
+    for word, index in _ORDINAL_IMAGE_TOKENS.items():
+        if re.search(rf"\b{re.escape(word)}\b", text):
+            return index
+    return None
+
+
+def _mentions_last_image(text: str) -> bool:
+    return _contains_word(text, ("latest", "last", "most recent", "son", "sonuncu", "en son"))
+
+
+def _mentions_previous_image(text: str) -> bool:
+    return _contains_word(text, ("previous", "prev", "prior", "onceki"))
+
+
+def _mentions_first_image(text: str) -> bool:
+    return _contains_word(text, ("first", "oldest", "ilk"))
+
+
+def _contains_word(text: str, words: tuple[str, ...]) -> bool:
+    return any(re.search(rf"\b{re.escape(word)}\b", text) for word in words)
+
+
+def _is_ambiguous_image_request(text: str) -> bool:
+    if _contains_any(text, _IMAGE_COMPARE_TOKENS):
+        return True
+    if "this or that" in text:
+        return True
+    pronouns = re.findall(r"\b(this|that|it|bunu|sunu)\b", text)
+    if len(set(pronouns)) >= 2:
+        return True
+    if pronouns and (" ya da " in text or " or " in text):
+        return True
+    return False
+
+
+def _build_image_disambiguation_message(session_context: dict | None) -> str:
+    images = _get_recent_images(session_context)
+    if not images:
+        return "Please send the image you want to edit."
+    lines = [
+        "I found multiple images. Which one should I use?",
+        "1=latest, 2=previous, 3=two back",
+    ]
+    for index, image in enumerate(reversed(images[-5:]), start=1):
+        summary = _format_recent_image_summary(image)
+        label = summary or "image"
+        lines.append(f"{index}) {label}")
+    lines.append("You can reply with 'latest', 'previous', or a number.")
+    return "\n".join(lines)
+
+
+_ORDINAL_IMAGE_TOKENS = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+}
+
+
 def _augment_session_context_for_image(
     task: str,
     session_context: dict[str, object] | None,
 ) -> dict[str, object] | None:
     if not session_context:
         return session_context
-    last_image_path = session_context.get("last_image_path")
-    if not last_image_path or not _mentions_image_reference(task):
+    if not _mentions_image_reference(task):
+        return session_context
+    reference_path, reference_summary, ambiguous = _resolve_image_reference(
+        task, session_context
+    )
+    if ambiguous or not reference_path:
         return session_context
     enriched = dict(session_context)
     enriched["intent_hints"] = {
-        "image_reference_path": last_image_path,
-        "image_reference_summary": session_context.get("last_image_summary"),
+        "image_reference_path": reference_path,
+        "image_reference_summary": reference_summary,
         "note": "The user references the last image with a pronoun.",
     }
     return enriched
@@ -3099,7 +4636,7 @@ def _mentions_image_reference(text: str) -> bool:
     normalized = _normalize_text(text)
     return _contains_any(
         normalized,
-        ("bunu", "sunu", "su", "this", "that", "o", "gorsel", "resim"),
+        ("this", "that", "it", "image", "photo", "picture", "bunu", "sunu", "resim", "gorsel"),
     )
 
 
@@ -3369,7 +4906,7 @@ async def _start_pc_task(
     show_thoughts = bool(getattr(settings, "show_thoughts", True))
     live_message = None
     if streaming_enabled and hasattr(llm_client, "stream_text"):
-        live_message = await message.reply_text("⏳ Planning PC actions...", parse_mode=ParseMode.HTML)
+        live_message = await message.reply_text("Planning PC actions...", parse_mode=ParseMode.HTML)
     else:
         await message.reply_text(f"Planning PC actions for: {task}")
     session_context = get_session_context(user_id)

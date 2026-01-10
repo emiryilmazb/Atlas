@@ -13,26 +13,17 @@ from app.sites.base import StepExecutionResult
 logger = logging.getLogger(__name__)
 
 _APPLY_TEXTS = (
-    "Başvur",
-    "Basvur",
-    "Hemen Başvur",
-    "Hemen Basvur",
-    "Başvuru Yap",
-    "Basvuru Yap",
-    "Hemen Başvuru Yap",
-    "Hemen Basvuru Yap",
+    "Apply",
+    "Apply Now",
+    "Submit Application",
 )
-_SUBMIT_TEXTS = ("Gönder", "Gonder", "Başvur", "Basvur", "Kaydet", "Devam")
-_LOGIN_LINK_TEXTS = ("Giriş Yap", "Giris Yap", "Üye Girişi", "Uye Girisi", "Login")
+_SUBMIT_TEXTS = ("Submit", "Save", "Continue", "Apply")
+_LOGIN_LINK_TEXTS = ("Sign In", "Login")
 _JOB_LISTINGS_TEXTS = (
-    "İş İlanları",
-    "Is Ilanlari",
-    "İş İlanları ve Başvuru",
-    "Is Ilanlari ve Basvuru",
-    "İş Arama",
-    "Is Arama",
-    "Kariyer.net İş İlanları",
-    "Kariyer.net Is Ilanlari",
+    "Job Listings",
+    "Job Listings and Application",
+    "Job Search",
+    "Kariyer.net Job Listings",
 )
 
 
@@ -250,27 +241,20 @@ async def _build_selector(field, tag: str) -> str | None:
 async def _find_search_box(page):
     generic = page.locator(
         "input[type='search'], input[name*='query'], input[name*='keyword'], "
-        "input[name*='pozisyon'], input[placeholder*='Pozisyon'], "
-        "input[placeholder*='Is'], input[placeholder*='İş'], input[placeholder*='İş'], input[placeholder*='İş'], input[placeholder*='Ara']"
+        "input[name*='position'], input[placeholder*='Position'], "
+        "input[placeholder*='Job'], input[placeholder*='Search']"
     )
     if await generic.count() > 0 and await generic.first.is_visible():
         return generic.first
 
     candidates = [
-        page.get_by_placeholder("Pozisyon"),
-        page.get_by_placeholder("Anahtar"),
-        page.get_by_placeholder("İş"),
-        page.get_by_placeholder("İş"),
-        page.get_by_placeholder("Is"),
-        page.get_by_placeholder("İş ara"),
-        page.get_by_placeholder("İş ara"),
-        page.get_by_placeholder("Is ara"),
-        page.get_by_placeholder("İş"),
-        page.get_by_placeholder("İş ara"),
-        page.get_by_placeholder("Ara"),
+        page.get_by_placeholder("Position"),
         page.get_by_placeholder("Keyword"),
-        page.get_by_role("textbox", name="Pozisyon"),
-        page.get_by_role("textbox", name="Anahtar"),
+        page.get_by_placeholder("Job"),
+        page.get_by_placeholder("Job search"),
+        page.get_by_placeholder("Search"),
+        page.get_by_role("textbox", name="Position"),
+        page.get_by_role("textbox", name="Keyword"),
     ]
     for candidate in candidates:
         if await candidate.count() > 0 and await candidate.first.is_visible():
@@ -318,7 +302,7 @@ async def _prepare_home_and_login(
 
 
 async def _handle_security_check(page, llm_client, agent_context, telegram_app, chat_id) -> None:
-    if await page.get_by_text("Kısa bir güvenlik doğrulaması", exact=False).count() == 0:
+    if await page.get_by_text("Security verification", exact=False).count() == 0:
         return
 
     button = await _find_hold_button(page)
@@ -379,7 +363,7 @@ async def _find_hold_button(page, text: str | None = None):
         if await locator.count() > 0 and await locator.first.is_visible():
             return locator.first
 
-    pattern = re.compile(r"bas[ıi]l[ıi]\s+tut", re.IGNORECASE)
+    pattern = re.compile(r"press\\s+and\\s+hold", re.IGNORECASE)
     locator = page.get_by_text(pattern)
     if await locator.count() > 0 and await locator.first.is_visible():
         return locator.first
@@ -409,7 +393,7 @@ async def _ask_gemini_for_security_action(page, llm_client) -> dict:
 
     prompt = (
         "A Turkish website shows a security verification prompt: "
-        "'Kısa bir güvenlik doğrulaması yapacağız… Aşağıdaki butona basılı tutarak doğrulamayı gerçekleştirebilirsin.' "
+        "'A security verification is required... Press and hold the button below to continue.' "
         "Decide the next action. Reply in this format:\n"
         "ACTION=HOLD|ASK_HUMAN\n"
         "SEND_SCREENSHOT=YES|NO\n"
@@ -438,10 +422,10 @@ async def _ensure_logged_in(page, username: str | None, password: str | None) ->
     await page.wait_for_load_state("domcontentloaded")
 
     email_input = page.locator(
-        "input[type='email'], input[name*='email'], input[placeholder*='E-posta'], input[placeholder*='Email']"
+        "input[type='email'], input[name*='email'], input[placeholder*='Email']"
     ).first
     password_input = page.locator(
-        "input[type='password'], input[name*='password'], input[placeholder*='Sifre'], input[placeholder*='Şifre']"
+        "input[type='password'], input[name*='password'], input[placeholder*='Password']"
     ).first
 
     if await email_input.count() == 0 or await password_input.count() == 0:
@@ -450,7 +434,7 @@ async def _ensure_logged_in(page, username: str | None, password: str | None) ->
     await email_input.fill(username)
     await password_input.fill(password)
 
-    submit = page.get_by_role("button", name="Giris Yap")
+    submit = page.get_by_role("button", name="Sign In")
     if await submit.count() > 0:
         await submit.first.click()
     else:

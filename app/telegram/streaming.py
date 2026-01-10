@@ -133,7 +133,7 @@ class AsyncStreamHandler:
         message_manager: MessageManager,
         *,
         show_thoughts: bool = True,
-        thought_label: str = "🧠 Thoughts",
+        thought_label: str = "Thoughts",
         response_label: str = "Decision",
         response_as_code: bool = False,
         max_length: int = _DEFAULT_MAX_LENGTH,
@@ -249,9 +249,9 @@ class AsyncStreamHandler:
             else:
                 blocks.append(body)
         if self._notice:
-            blocks.append(f"⚠️ {_escape_html(self._notice)}")
+            blocks.append(f"WARNING: {_escape_html(self._notice)}")
         if not blocks:
-            return "⏳ Thinking..."
+            return "Thinking..."
         formatted = "\n\n".join(blocks)
         if len(formatted) > self._max_length:
             formatted = "\n\n".join(blocks[:2])

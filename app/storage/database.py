@@ -12,7 +12,12 @@ from app.config import get_settings
 
 def _default_db_path() -> Path:
     root = Path(__file__).resolve().parents[2]
-    return root / "memory" / "applywise.db"
+    atlas_path = root / "memory" / "atlas.db"
+    legacy_path = root / "memory" / "applywise.db"
+    # Preserve existing data when upgrading project name.
+    if not atlas_path.exists() and legacy_path.exists():
+        return legacy_path
+    return atlas_path
 
 
 def _utc_now() -> str:
@@ -29,6 +34,21 @@ class MessageRow:
     source: str | None = None
     source_message_id: str | None = None
     source_chat_id: str | None = None
+
+
+@dataclass(frozen=True)
+class MemoryItemRow:
+    id: int
+    user_key: str
+    chat_id: str | None
+    kind: str
+    title: str | None
+    summary: str
+    tags: str | None
+    embedding: bytes | None
+    importance: float
+    created_at: str
+    last_used_at: str | None
 
 
 class DatabaseManager:
@@ -91,6 +111,20 @@ class DatabaseManager:
         );
         CREATE INDEX IF NOT EXISTS idx_session_short_term_user_pos
             ON session_short_term_memory(user_id, position);
+
+        CREATE TABLE IF NOT EXISTS session_images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            image_path TEXT NOT NULL,
+            image_prompt TEXT,
+            image_summary TEXT,
+            image_source TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES sessions(user_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_images_user_pos
+            ON session_images(user_id, position);
 
         CREATE TABLE IF NOT EXISTS personal_facts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,6 +236,7 @@ class DatabaseManager:
         with self._lock, self._connection:
             self._connection.executescript(schema)
         self._ensure_message_columns()
+        self._ensure_memory_tables()
 
     def add_message(
         self,
@@ -376,6 +411,148 @@ class DatabaseManager:
             self._connection.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
         return file_paths
 
+    def get_anonymous_mode(self, user_key: str, default: bool = False) -> bool:
+        if not user_key:
+            return default
+        row = self._fetchone(
+            "SELECT anonymous_mode FROM user_settings WHERE user_key = ?",
+            (user_key,),
+        )
+        if row is None:
+            return default
+        return bool(row["anonymous_mode"])
+
+    def set_anonymous_mode(self, user_key: str, enabled: bool) -> None:
+        if not user_key:
+            return
+        updated_at = _utc_now()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO user_settings (user_key, anonymous_mode, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_key) DO UPDATE SET
+                    anonymous_mode = excluded.anonymous_mode,
+                    updated_at = excluded.updated_at
+                """,
+                (user_key, 1 if enabled else 0, updated_at),
+            )
+
+    def get_user_profile(self, user_key: str) -> str | None:
+        if not user_key:
+            return None
+        row = self._fetchone(
+            "SELECT profile_json FROM user_profile WHERE user_key = ?",
+            (user_key,),
+        )
+        if row is None:
+            return None
+        return row["profile_json"]
+
+    def set_user_profile(self, user_key: str, profile_json: str) -> None:
+        if not user_key:
+            return
+        updated_at = _utc_now()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO user_profile (user_key, profile_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_key) DO UPDATE SET
+                    profile_json = excluded.profile_json,
+                    updated_at = excluded.updated_at
+                """,
+                (user_key, profile_json, updated_at),
+            )
+
+    def add_memory_item(
+        self,
+        *,
+        user_key: str,
+        chat_id: str | None,
+        kind: str,
+        title: str | None,
+        summary: str,
+        tags: str | None,
+        embedding: bytes | None,
+        importance: float,
+    ) -> int:
+        created_at = _utc_now()
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO memory_items (
+                    user_key, chat_id, kind, title, summary, tags,
+                    embedding, importance, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_key,
+                    chat_id,
+                    kind,
+                    title,
+                    summary,
+                    tags,
+                    embedding,
+                    float(importance),
+                    created_at,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def get_memory_items(self, user_key: str, limit: int = 500) -> list[MemoryItemRow]:
+        if not user_key:
+            return []
+        rows = self._fetchall(
+            """
+            SELECT id, user_key, chat_id, kind, title, summary, tags,
+                   embedding, importance, created_at, last_used_at
+            FROM memory_items
+            WHERE user_key = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (user_key, limit),
+        )
+        return [
+            MemoryItemRow(
+                id=int(row["id"]),
+                user_key=row["user_key"],
+                chat_id=row["chat_id"],
+                kind=row["kind"],
+                title=row["title"],
+                summary=row["summary"],
+                tags=row["tags"],
+                embedding=row["embedding"],
+                importance=float(row["importance"] or 0.0),
+                created_at=row["created_at"],
+                last_used_at=row["last_used_at"],
+            )
+            for row in rows
+        ]
+
+    def update_memory_last_used(self, ids: Iterable[int]) -> None:
+        id_list = [int(item) for item in ids if item]
+        if not id_list:
+            return
+        updated_at = _utc_now()
+        with self._lock, self._connection:
+            self._connection.executemany(
+                "UPDATE memory_items SET last_used_at = ? WHERE id = ?",
+                [(updated_at, item) for item in id_list],
+            )
+
+    def delete_memory_item(self, user_key: str, memory_id: int) -> bool:
+        if not user_key or not memory_id:
+            return False
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM memory_items WHERE user_key = ? AND id = ?",
+                (user_key, int(memory_id)),
+            )
+            return cursor.rowcount > 0
+
     def load_sessions(self) -> dict[str, dict[str, Any]]:
         sessions = {}
         session_rows = self._fetchall(
@@ -396,6 +573,7 @@ class DatabaseManager:
                 "last_image_source": row["last_image_source"],
                 "pending_details": {},
                 "short_term_memory": [],
+                "recent_images": [],
             }
 
         pending_rows = self._fetchall(
@@ -419,6 +597,26 @@ class DatabaseManager:
             if payload is None:
                 continue
             payload["short_term_memory"].append(row["message"])
+
+        image_rows = self._fetchall(
+            """
+            SELECT user_id, image_path, image_prompt, image_summary, image_source
+            FROM session_images
+            ORDER BY position ASC, id ASC
+            """,
+        )
+        for row in image_rows:
+            payload = sessions.get(row["user_id"])
+            if payload is None:
+                continue
+            payload["recent_images"].append(
+                {
+                    "path": row["image_path"],
+                    "prompt": row["image_prompt"],
+                    "summary": row["image_summary"],
+                    "source": row["image_source"],
+                }
+            )
         return sessions
 
     def save_session_state(
@@ -434,6 +632,7 @@ class DatabaseManager:
         last_image_prompt: str | None,
         last_image_summary: str | None,
         last_image_source: str | None,
+        recent_images: list[dict[str, Any]],
     ) -> None:
         updated_at = _utc_now()
         with self._lock, self._connection:
@@ -492,6 +691,32 @@ class DatabaseManager:
                     VALUES (?, ?, ?, ?)
                     """,
                     (user_id, position, message, updated_at),
+                )
+            self._connection.execute(
+                "DELETE FROM session_images WHERE user_id = ?",
+                (user_id,),
+            )
+            for position, image in enumerate(recent_images):
+                image_path = image.get("path") if isinstance(image, dict) else None
+                if not image_path:
+                    continue
+                self._connection.execute(
+                    """
+                    INSERT INTO session_images (
+                        user_id, position, image_path, image_prompt,
+                        image_summary, image_source, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        position,
+                        image_path,
+                        image.get("prompt") if isinstance(image, dict) else None,
+                        image.get("summary") if isinstance(image, dict) else None,
+                        image.get("source") if isinstance(image, dict) else None,
+                        updated_at,
+                    ),
                 )
 
     def delete_session(self, user_id: str) -> None:
@@ -820,6 +1045,35 @@ class DatabaseManager:
         )
         return [dict(row) for row in rows]
 
+    def has_gmail_notification(self, user_key: str, message_id: str) -> bool:
+        if not user_key or not message_id:
+            return False
+        row = self._fetchone(
+            """
+            SELECT 1 FROM gmail_notifications
+            WHERE user_key = ? AND message_id = ?
+            LIMIT 1
+            """,
+            (user_key, message_id),
+        )
+        return row is not None
+
+    def mark_gmail_notified(self, user_key: str, message_id: str, label: str | None = None) -> None:
+        if not user_key or not message_id:
+            return
+        notified_at = _utc_now()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO gmail_notifications (user_key, message_id, label, notified_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_key, message_id) DO UPDATE SET
+                    label = excluded.label,
+                    notified_at = excluded.notified_at
+                """,
+                (user_key, message_id, label, notified_at),
+            )
+
     def count_table(self, table: str) -> int:
         row = self._fetchone(f"SELECT COUNT(*) AS count FROM {table}")
         if row is None:
@@ -879,6 +1133,93 @@ class DatabaseManager:
                 """
                 CREATE INDEX IF NOT EXISTS idx_messages_source
                 ON messages(user_id, source, source_chat_id, source_message_id)
+                """
+            )
+
+    def _ensure_memory_tables(self) -> None:
+        existing = {
+            row["name"]
+            for row in self._fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        with self._lock, self._connection:
+            if "memory_items" not in existing:
+                self._connection.execute(
+                    """
+                    CREATE TABLE memory_items (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_key TEXT NOT NULL,
+                        chat_id TEXT,
+                        kind TEXT NOT NULL DEFAULT 'summary',
+                        title TEXT,
+                        summary TEXT NOT NULL,
+                        tags TEXT,
+                        embedding BLOB,
+                        importance REAL DEFAULT 0.5,
+                        created_at TEXT NOT NULL,
+                        last_used_at TEXT
+                    )
+                    """
+                )
+            if "user_profile" not in existing:
+                self._connection.execute(
+                    """
+                    CREATE TABLE user_profile (
+                        user_key TEXT PRIMARY KEY,
+                        profile_json TEXT,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+            if "user_settings" not in existing:
+                self._connection.execute(
+                    """
+                    CREATE TABLE user_settings (
+                        user_key TEXT PRIMARY KEY,
+                        anonymous_mode INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+            if "memory_events" not in existing:
+                self._connection.execute(
+                    """
+                    CREATE TABLE memory_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_key TEXT,
+                        event_type TEXT,
+                        payload TEXT,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+            if "gmail_notifications" not in existing:
+                self._connection.execute(
+                    """
+                    CREATE TABLE gmail_notifications (
+                        user_key TEXT NOT NULL,
+                        message_id TEXT NOT NULL,
+                        label TEXT,
+                        notified_at TEXT NOT NULL,
+                        PRIMARY KEY (user_key, message_id)
+                    )
+                    """
+                )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_items_user_created
+                ON memory_items(user_key, created_at)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_items_user_last_used
+                ON memory_items(user_key, last_used_at)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_gmail_notifications_user_time
+                ON gmail_notifications(user_key, notified_at)
                 """
             )
 

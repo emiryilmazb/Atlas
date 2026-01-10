@@ -303,7 +303,7 @@ def _contains_message_intent(text: str) -> bool:
     normalized = _normalize_text(text)
     return any(
         token in normalized
-        for token in ("message", "mesaj", "send", "yaz", "gonder", "yolla", "ileti")
+        for token in ("message", "send", "text", "reply", "dm", "mesaj", "yaz", "gonder", "yolla", "ileti")
     )
 
 
@@ -318,7 +318,7 @@ def _mentions_messaging_app(text: str) -> bool:
 def _find_message_insert_index(steps: list[dict[str, Any]]) -> int | None:
     for idx in range(len(steps) - 1, -1, -1):
         normalized = _normalize_text(_step_text(steps[idx]))
-        if any(token in normalized for token in ("chat", "contact", "sohbet", "message", "mesaj", "search", "ara")):
+        if any(token in normalized for token in ("chat", "contact", "message", "search", "sohbet", "ara")):
             return idx
     return None
 
@@ -326,7 +326,7 @@ def _find_message_insert_index(steps: list[dict[str, Any]]) -> int | None:
 def _find_send_step_index(steps: list[dict[str, Any]]) -> int | None:
     for idx, step in enumerate(steps):
         normalized = _normalize_text(_step_text(step))
-        if any(token in normalized for token in ("send", "gonder", "yolla", "ileti gonder")):
+        if any(token in normalized for token in ("send", "deliver", "submit", "gonder", "yolla", "ileti gonder")):
             return idx
     return None
 
@@ -335,7 +335,7 @@ def _is_message_step(step: dict[str, Any]) -> bool:
     normalized = _normalize_text(_step_text(step))
     return any(
         token in normalized
-        for token in ("message", "mesaj", "input", "yazi", "send", "yaz", "gonder", "yolla")
+        for token in ("message", "input", "type", "send", "reply", "text", "mesaj", "yazi", "yaz", "gonder", "yolla")
     )
 
 
@@ -412,7 +412,7 @@ def _last_message_from_context(session_context: dict[str, Any] | None) -> str | 
 
 
 def _is_send_token(token: str) -> bool:
-    verbs = ("yaz", "gonder", "yolla", "mesajla", "send", "text", "reply")
+    verbs = ("send", "text", "reply", "message", "deliver", "yaz", "gonder", "yolla", "mesajla")
     return any(token == verb or token.startswith(verb) for verb in verbs)
 
 
@@ -421,22 +421,15 @@ def _clean_message_tokens(tokens: list[str]) -> str:
         return ""
     normalized = [_normalize_text(_strip_token(token)) for token in tokens]
     stopwords = {
-        "ona",
-        "onlara",
-        "onun",
-        "bana",
-        "sana",
-        "bunu",
-        "su",
-        "sunu",
-        "lutfen",
         "please",
+        "lutfen",
         "to",
         "for",
         "the",
-        "mesaj",
         "message",
         "text",
+        "email",
+        "mesaj",
     }
     if tokens and _looks_like_recipient_token(tokens[0]):
         normalized.pop(0)
@@ -447,7 +440,7 @@ def _clean_message_tokens(tokens: list[str]) -> str:
     while normalized and normalized[-1] in stopwords:
         normalized.pop()
         tokens.pop()
-    cleaned = [token for token in tokens if _normalize_text(_strip_token(token)) not in {"mesaj", "message", "text"}]
+    cleaned = [token for token in tokens if _normalize_text(_strip_token(token)) not in {"message", "text"}]
     return " ".join(cleaned).strip()
 
 
@@ -459,7 +452,7 @@ def _looks_like_recipient_token(token: str) -> bool:
     if len(parts) < 2:
         return False
     suffix = parts[-1].lower()
-    return suffix in {"a", "e", "ya", "ye"}
+    return suffix in {"to", "a", "e", "ya", "ye"}
 
 
 def _strip_token(value: str) -> str:

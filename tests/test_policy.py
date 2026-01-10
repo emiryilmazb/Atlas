@@ -13,7 +13,7 @@ class AnswerFlowTests(unittest.TestCase):
             past_answers={"entries": []},
         )
         normalized = NormalizedQuestion("Why do you want to work here?", Intent.MOTIVATION_COMPANY)
-        response = generate_answer(normalized, None, memory, "ApplyWise", "Engineer")
+        response = generate_answer(normalized, None, memory, "Atlas", "Engineer")
         self.assertTrue(is_needs_human_response(response))
 
     def test_prompt_includes_matching_past_answers(self) -> None:
@@ -24,7 +24,7 @@ class AnswerFlowTests(unittest.TestCase):
                 "entries": [
                     {
                         "intent": Intent.MOTIVATION_COMPANY.value,
-                        "question": "Why ApplyWise?",
+                        "question": "Why Atlas?",
                         "answer": "I align with the mission.",
                         "submitted_at": "2026-01-05T13:21:00Z",
                     },
@@ -38,10 +38,10 @@ class AnswerFlowTests(unittest.TestCase):
             },
         )
         normalized = NormalizedQuestion("Why this company?", Intent.MOTIVATION_COMPANY)
-        prompt = build_answer_prompt(normalized, memory, "ApplyWise", "Engineer")
+        prompt = build_answer_prompt(normalized, memory, "Atlas", "Engineer")
         self.assertIn("Product-minded engineer.", prompt)
         self.assertIn("Led API redesign.", prompt)
-        self.assertIn("Why ApplyWise?", prompt)
+        self.assertIn("Why Atlas?", prompt)
         self.assertNotIn("Tech stack?", prompt)
 
 

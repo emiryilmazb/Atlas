@@ -22,6 +22,12 @@ class RouterIntent(Enum):
     COMPUTER_USE = "COMPUTER_USE"
     IMAGE_GEN = "IMAGE_GEN"
     IMAGE_EDIT = "IMAGE_EDIT"
+    GMAIL_INBOX = "GMAIL_INBOX"
+    GMAIL_SUMMARY = "GMAIL_SUMMARY"
+    GMAIL_SEARCH = "GMAIL_SEARCH"
+    GMAIL_DRAFT = "GMAIL_DRAFT"
+    GMAIL_SEND = "GMAIL_SEND"
+    GMAIL_QUESTION = "GMAIL_QUESTION"
 
 
 @dataclass(frozen=True)
@@ -40,6 +46,8 @@ _IMAGE_GEN_TOKENS = (
     "ciz",
     "uret",
     "tasarla",
+    "illustrate",
+    "render",
 )
 _IMAGE_EDIT_TOKENS = (
     "edit",
@@ -57,6 +65,8 @@ _IMAGE_EDIT_TOKENS = (
     "color",
     "background",
     "arka plan",
+    "retouch",
+    "adjust",
 )
 _COMPUTER_USE_TOKENS = (
     "pc",
@@ -72,7 +82,7 @@ _COMPUTER_USE_TOKENS = (
     "type",
     "yaz",
     "send",
-    "mesaj",
+    "message",
     "browser",
     "chrome",
     "spotify",
@@ -90,9 +100,34 @@ _COMPUTER_USE_TOKENS = (
     "form",
     "upload",
     "cv",
+    "resume",
 )
-_IMAGE_PRONOUN_TOKENS = ("bunu", "sunu", "su", "that",
-                         "this", "o", "gorsel", "resim")
+_IMAGE_PRONOUN_TOKENS = (
+    "that",
+    "this",
+    "it",
+    "image",
+    "photo",
+    "picture",
+    "bunu",
+    "sunu",
+)
+_GMAIL_TOKENS = (
+    "gmail",
+    "mail",
+    "email",
+    "eposta",
+    "inbox",
+    "inbox mail",
+    "gelen kutu",
+    "gelen kutusu",
+    "gelen kutum",
+)
+_GMAIL_SUMMARY_TOKENS = ("summarize", "summary", "brief summary", "ozet", "kisa ozet")
+_GMAIL_SEARCH_TOKENS = ("ara", "search", "bul", "find")
+_GMAIL_DRAFT_TOKENS = ("taslak", "draft", "yaz", "olustur", "hazirla")
+_GMAIL_SEND_TOKENS = ("send", "deliver", "email", "mail", "gonder", "yolla", "mail at")
+_GMAIL_QUESTION_TOKENS = ("otp", "code", "how many", "count", "number of", "onay kodu", "kac tane", "sayi")
 
 
 def route_intent(
@@ -152,6 +187,12 @@ Choose exactly one intent:
 - COMPUTER_USE: requests to operate the computer, apps, or browser.
 - IMAGE_GEN: requests to generate a new image from text.
 - IMAGE_EDIT: requests to edit, transform, or analyze an image (image-to-image or vision).
+- GMAIL_INBOX: requests to check inbox or list recent emails.
+- GMAIL_SUMMARY: requests to summarize recent emails.
+- GMAIL_SEARCH: requests to search emails with a query.
+- GMAIL_DRAFT: requests to draft an email (may ask to send after approval).
+- GMAIL_SEND: explicit request to send an email (requires approval).
+- GMAIL_QUESTION: questions that require reading emails (counts, codes, status).
 
 Guidance:
 - If an image is attached, and the user asks to change or analyze it, choose IMAGE_EDIT.
@@ -168,7 +209,7 @@ Has image: {str(has_image).lower()}
 User message: {message_text}
 
 Return ONLY JSON with this shape:
-{{ "intent": "CHAT|COMPUTER_USE|IMAGE_GEN|IMAGE_EDIT", "reason": "<short reason>" }}
+{{ "intent": "CHAT|COMPUTER_USE|IMAGE_GEN|IMAGE_EDIT|GMAIL_INBOX|GMAIL_SUMMARY|GMAIL_SEARCH|GMAIL_DRAFT|GMAIL_SEND|GMAIL_QUESTION", "reason": "<short reason>" }}
 """.strip()
 
 
@@ -219,17 +260,42 @@ def _fallback_intent(
         return RouterDecision(intent=RouterIntent.IMAGE_EDIT, reason="fallback:edit")
     if _contains_any(normalized, _IMAGE_GEN_TOKENS):
         return RouterDecision(intent=RouterIntent.IMAGE_GEN, reason="fallback:gen")
+    if _contains_any(normalized, _GMAIL_TOKENS):
+        return _fallback_gmail_intent(normalized)
     if _contains_any(normalized, _COMPUTER_USE_TOKENS):
         return RouterDecision(intent=RouterIntent.COMPUTER_USE, reason="fallback:pc")
-    if session_context and session_context.get("last_image_path") and _contains_any(normalized, _IMAGE_PRONOUN_TOKENS):
+    if _has_recent_images(session_context) and _contains_any(normalized, _IMAGE_PRONOUN_TOKENS):
         if _contains_any(normalized, ("masaustu", "desktop", "wallpaper")):
             return RouterDecision(intent=RouterIntent.COMPUTER_USE, reason="fallback:pronoun_pc")
         return RouterDecision(intent=RouterIntent.IMAGE_EDIT, reason="fallback:pronoun_edit")
     return RouterDecision(intent=RouterIntent.CHAT, reason="fallback:chat")
 
 
+def _fallback_gmail_intent(normalized: str) -> RouterDecision:
+    if _contains_any(normalized, _GMAIL_SEND_TOKENS):
+        return RouterDecision(intent=RouterIntent.GMAIL_SEND, reason="fallback:gmail_send")
+    if _contains_any(normalized, _GMAIL_SUMMARY_TOKENS):
+        return RouterDecision(intent=RouterIntent.GMAIL_SUMMARY, reason="fallback:gmail_summary")
+    if _contains_any(normalized, _GMAIL_SEARCH_TOKENS):
+        return RouterDecision(intent=RouterIntent.GMAIL_SEARCH, reason="fallback:gmail_search")
+    if _contains_any(normalized, _GMAIL_DRAFT_TOKENS):
+        return RouterDecision(intent=RouterIntent.GMAIL_DRAFT, reason="fallback:gmail_draft")
+    if _contains_any(normalized, _GMAIL_QUESTION_TOKENS):
+        return RouterDecision(intent=RouterIntent.GMAIL_QUESTION, reason="fallback:gmail_question")
+    return RouterDecision(intent=RouterIntent.GMAIL_INBOX, reason="fallback:gmail_inbox")
+
+
 def _contains_any(text: str, tokens: tuple[str, ...]) -> bool:
     return any(token in text for token in tokens)
+
+
+def _has_recent_images(session_context: dict[str, Any] | None) -> bool:
+    if not session_context:
+        return False
+    if session_context.get("last_image_path"):
+        return True
+    recent = session_context.get("recent_images")
+    return isinstance(recent, list) and bool(recent)
 
 
 def _normalize_text(value: str) -> str:

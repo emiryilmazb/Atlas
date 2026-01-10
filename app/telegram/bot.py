@@ -8,13 +8,23 @@ from telegram.ext import (
 )
 
 from app.config import get_settings
+from app.services.gmail_polling import schedule_gmail_polling
 
 from .handlers import (
     handle_button,
     handle_document_message,
+    handle_forget_command,
+    handle_gmail_auth_command,
+    handle_inbox_command,
+    handle_memory_command,
     handle_media_message,
     handle_pc_command,
     handle_photo_message,
+    handle_profile_command,
+    handle_profile_forget_command,
+    handle_search_mail_command,
+    handle_summarize_last_command,
+    handle_draft_mail_command,
     handle_text_message,
     start,
 )
@@ -28,6 +38,7 @@ async def _post_init(application: Application) -> None:
         chat_id=settings.telegram_chat_id,
         text="Bot initialized successfully",
     )
+    schedule_gmail_polling(application)
 
 
 def build_application() -> Application:
@@ -43,6 +54,15 @@ def build_application() -> Application:
     )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("pc", handle_pc_command))
+    application.add_handler(CommandHandler("memory", handle_memory_command))
+    application.add_handler(CommandHandler("forget", handle_forget_command))
+    application.add_handler(CommandHandler("profile", handle_profile_command))
+    application.add_handler(CommandHandler("profile_forget", handle_profile_forget_command))
+    application.add_handler(CommandHandler("gmail_auth", handle_gmail_auth_command))
+    application.add_handler(CommandHandler("inbox", handle_inbox_command))
+    application.add_handler(CommandHandler("summarize_last", handle_summarize_last_command))
+    application.add_handler(CommandHandler("search_mail", handle_search_mail_command))
+    application.add_handler(CommandHandler("draft_mail", handle_draft_mail_command))
     application.add_handler(CallbackQueryHandler(handle_button))
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo_message))
     application.add_handler(

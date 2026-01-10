@@ -1,8 +1,16 @@
 python-telegram-bot
 python-dotenv
 google-genai
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
 playwright
 pywinauto
 pyautogui
 Pillow
 psutil
+numpy
+scikit-learn
+sentence-transformers
+torch
+pytest

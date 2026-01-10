@@ -1028,7 +1028,7 @@ def _hover_spotify_top_result_card(llm_client: Any) -> None:
     if not llm_client:
         return
     top_anchor = find_ui_element(
-        "En çok dinlenen sonuç", llm_client=llm_client, use_vision=False
+        "Top result", llm_client=llm_client, use_vision=False
     )
     if not top_anchor:
         top_anchor = find_ui_element(
@@ -1045,7 +1045,7 @@ def _hover_spotify_first_song_row(llm_client: Any) -> None:
     if not llm_client:
         return
     songs_anchor = find_ui_element(
-        "Şarkılar", llm_client=llm_client, use_vision=False)
+        "Songs", llm_client=llm_client, use_vision=False)
     if not songs_anchor:
         songs_anchor = find_ui_element(
             "Songs", llm_client=llm_client, use_vision=False)
@@ -1137,8 +1137,8 @@ def _click_spotify_first_result(llm_client: Any, timeout_seconds: float = 6) -> 
         "Top result",
         "Top results",
         "Tracks",
-        "Şarkılar",
-        "En çok dinlenen sonuç",
+        "Songs",
+        "Top result",
     ]
     while time.monotonic() < deadline:
         for anchor in anchors:
@@ -1227,7 +1227,7 @@ def _is_spotify_playing(llm_client: Any) -> bool:
     if play_element:
         return False
     play_element = find_ui_element(
-        "Çal", llm_client=llm_client, use_vision=False)
+        "Play", llm_client=llm_client, use_vision=False)
     if play_element:
         return False
     if llm_client:
@@ -1260,13 +1260,13 @@ def _is_search_step(description: str | None, instruction: str | None) -> bool:
 def _should_press_enter_for_send(description: str | None, instruction: str | None) -> bool:
     combined = f"{description or ''} {instruction or ''}".strip()
     normalized = _normalize_text(combined)
-    return any(token in normalized for token in ("send", "gonder", "yolla", "ileti gonder"))
+    return any(token in normalized for token in ("send", "deliver", "submit", "gonder", "yolla", "ileti gonder"))
 
 
 def _is_message_step(description: str | None, instruction: str | None) -> bool:
     combined = f"{description or ''} {instruction or ''}".strip()
     normalized = _normalize_text(combined)
-    return any(token in normalized for token in ("message", "mesaj", "input", "yazi", "type and send"))
+    return any(token in normalized for token in ("message", "input", "type", "type and send", "mesaj", "yazi"))
 
 
 def _is_chat_selection_step(description: str | None, instruction: str | None) -> bool:

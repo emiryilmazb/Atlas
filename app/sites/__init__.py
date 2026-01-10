@@ -1,1 +1,1 @@
-"""Site adapter package for ApplyWise."""
+"""Site adapter package for Atlas."""
