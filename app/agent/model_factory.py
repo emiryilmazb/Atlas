@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from app.agent.llm_client import (
@@ -8,6 +9,8 @@ from app.agent.llm_client import (
     build_image_client,
     build_llm_client,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ModelFactory:

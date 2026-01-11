@@ -40,6 +40,10 @@ class Settings:
     gmail_focus_labels: str = "Critical,Action Required"
     gmail_oauth_flow: str = "local"
     gmail_oauth_open_browser: bool = True
+    drive_token_path: str = ""
+    drive_scopes: str = ""
+    photos_token_path: str = ""
+    photos_scopes: str = ""
     streaming_enabled: bool = True
     show_thoughts: bool = True
     screenshot_enabled: bool = True
@@ -116,6 +120,10 @@ def get_settings() -> Settings:
         gmail_focus_labels=os.getenv("GMAIL_FOCUS_LABELS", "Critical,Action Required"),
         gmail_oauth_flow=os.getenv("GMAIL_OAUTH_FLOW", "local"),
         gmail_oauth_open_browser=_env_flag("GMAIL_OAUTH_OPEN_BROWSER", True),
+        drive_token_path=os.getenv("DRIVE_OAUTH_TOKEN_PATH", ""),
+        drive_scopes=os.getenv("DRIVE_SCOPES", ""),
+        photos_token_path=os.getenv("PHOTOS_OAUTH_TOKEN_PATH", ""),
+        photos_scopes=os.getenv("PHOTOS_SCOPES", ""),
         streaming_enabled=_env_flag("STREAMING_ENABLED", True),
         show_thoughts=_env_flag("SHOW_THOUGHTS", True),
         screenshot_enabled=_env_flag("SCREENSHOT_ENABLED", True),

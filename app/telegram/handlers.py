@@ -24,6 +24,7 @@ from app.agent.llm_client import (
     GEMINI_FLASH_MAX_INLINE_IMAGE_BYTES,
     GEMINI_IMAGE_MIME_TYPES,
 )
+from app.agent.workspace_orchestrator import orchestrate_workspace_request
 from app.config import get_settings
 from app.memory.long_term import ConversationMemoryManager, migrate_profile_json
 from app.session_manager import (
@@ -34,6 +35,13 @@ from app.session_manager import (
     should_reset_context,
 )
 from app.services.gmail_service import GMAIL_LABELS, DraftSpec, build_gmail_service
+from app.services.google_calendar_service import build_calendar_service
+from app.services.google_people_service import build_people_service
+from app.services.google_drive_service import build_drive_service
+from app.services.google_photos_service import build_photos_service
+from app.services.google_sheets_service import build_sheets_service
+from app.services.google_tasks_service import build_tasks_service
+from app.services.google_youtube_service import build_youtube_service
 from app.storage.database import get_database
 from app.storage.user_settings import is_anonymous_mode, set_anonymous_mode
 from app.telegram.streaming import AsyncStreamHandler, MessageManager
@@ -487,6 +495,76 @@ def _get_gmail_service(context: ContextTypes.DEFAULT_TYPE):
     return service
 
 
+def _get_calendar_service(context: ContextTypes.DEFAULT_TYPE):
+    service = context.application.bot_data.get("calendar_service")
+    if service is not None:
+        return service
+    settings = _resolve_settings(context)
+    service = build_calendar_service(settings)
+    context.application.bot_data["calendar_service"] = service
+    return service
+
+
+def _get_tasks_service(context: ContextTypes.DEFAULT_TYPE):
+    service = context.application.bot_data.get("tasks_service")
+    if service is not None:
+        return service
+    settings = _resolve_settings(context)
+    service = build_tasks_service(settings)
+    context.application.bot_data["tasks_service"] = service
+    return service
+
+
+def _get_people_service(context: ContextTypes.DEFAULT_TYPE):
+    service = context.application.bot_data.get("people_service")
+    if service is not None:
+        return service
+    settings = _resolve_settings(context)
+    service = build_people_service(settings)
+    context.application.bot_data["people_service"] = service
+    return service
+
+
+def _get_drive_service(context: ContextTypes.DEFAULT_TYPE):
+    service = context.application.bot_data.get("drive_service")
+    if service is not None:
+        return service
+    settings = _resolve_settings(context)
+    service = build_drive_service(settings)
+    context.application.bot_data["drive_service"] = service
+    return service
+
+
+def _get_photos_service(context: ContextTypes.DEFAULT_TYPE):
+    service = context.application.bot_data.get("photos_service")
+    if service is not None:
+        return service
+    settings = _resolve_settings(context)
+    service = build_photos_service(settings)
+    context.application.bot_data["photos_service"] = service
+    return service
+
+
+def _get_sheets_service(context: ContextTypes.DEFAULT_TYPE):
+    service = context.application.bot_data.get("sheets_service")
+    if service is not None:
+        return service
+    settings = _resolve_settings(context)
+    service = build_sheets_service(settings)
+    context.application.bot_data["sheets_service"] = service
+    return service
+
+
+def _get_youtube_service(context: ContextTypes.DEFAULT_TYPE):
+    service = context.application.bot_data.get("youtube_service")
+    if service is not None:
+        return service
+    settings = _resolve_settings(context)
+    service = build_youtube_service(settings)
+    context.application.bot_data["youtube_service"] = service
+    return service
+
+
 def _parse_limit_arg(value: str | None, default: int = 5, max_value: int = 25) -> int:
     if not value:
         return default
@@ -745,6 +823,108 @@ def _parse_gmail_action_plan(intent: RouterIntent, payload: dict) -> dict:
         "focus_mode": payload.get("focus_mode"),
         "vip_only": payload.get("vip_only"),
     }
+
+
+async def _handle_workspace_request(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    *,
+    message_text: str,
+    session_context: dict | None,
+) -> bool:
+    llm_client = context.application.bot_data.get("llm_client")
+    if llm_client is None:
+        return False
+    try:
+        gmail_service = _get_gmail_service(context)
+        calendar_service = _get_calendar_service(context)
+        tasks_service = _get_tasks_service(context)
+        people_service = _get_people_service(context)
+        drive_service = _get_drive_service(context)
+        photos_service = _get_photos_service(context)
+        sheets_service = _get_sheets_service(context)
+        youtube_service = _get_youtube_service(context)
+    except Exception as exc:
+        logger.warning("Workspace services unavailable: %s", exc)
+        await message.reply_text("Google workspace services are not configured.")
+        return True
+    try:
+        result = await asyncio.to_thread(
+            orchestrate_workspace_request,
+            llm_client=llm_client,
+            gmail_service=gmail_service,
+            calendar_service=calendar_service,
+            tasks_service=tasks_service,
+            people_service=people_service,
+            drive_service=drive_service,
+            photos_service=photos_service,
+            sheets_service=sheets_service,
+            youtube_service=youtube_service,
+            message_text=message_text,
+            session_context=session_context,
+        )
+    except Exception as exc:  # pragma: no cover - runtime/api errors
+        logger.warning("Workspace orchestration failed: %s", exc)
+        await message.reply_text("I was unable to process that request right now.")
+        return True
+    if not result.handled:
+        return False
+    draft_action = next(
+        (
+            action
+            for action in result.actions
+            if action.ok and action.name == "gmail_create_draft" and isinstance(action.result, dict)
+        ),
+        None,
+    )
+    send_action = next(
+        (action for action in result.actions if action.ok and action.name == "gmail_send_draft"),
+        None,
+    )
+    if draft_action and send_action is None and _should_send_email(message_text):
+        agent_context = context.application.bot_data.get("agent_context")
+        if agent_context is None:
+            await message.reply_text("Draft created, but approval flow is unavailable.")
+            return True
+        draft_payload = draft_action.result or {}
+        draft_data = draft_payload.get("draft") if isinstance(draft_payload, dict) else None
+        draft_id = str(draft_payload.get("draft_id") or "").strip()
+        if not isinstance(draft_data, dict) or not draft_id:
+            await message.reply_text("Draft created, but I could not prepare the send approval.")
+            return True
+        spec = DraftSpec(
+            to=str(draft_data.get("to") or "").strip(),
+            subject=str(draft_data.get("subject") or "").strip(),
+            body=str(draft_data.get("body") or "").strip(),
+        )
+        question_id = str(uuid4())
+        agent_context.create_pending_request(
+            question_id=question_id,
+            intent="gmail_send",
+            question="Gmail draft is ready. Send it?",
+            category="gmail_send",
+        )
+        _store_gmail_pending_send(
+            context,
+            question_id,
+            {
+                "draft_id": draft_id,
+                "to": spec.to,
+                "subject": spec.subject,
+                "body": spec.body,
+            },
+        )
+        preview_text = _build_draft_preview_text(spec)
+        await message.reply_text(
+            f"Draft ready:\n{preview_text}\n\nSend it?",
+            reply_markup=_build_gmail_send_keyboard(),
+        )
+        return True
+    response_text = (result.response_text or "").strip()
+    if not response_text:
+        response_text = "Please share a bit more detail so I can proceed."
+    await message.reply_text(response_text)
+    return True
 
 
 async def _handle_gmail_intelligent_request(
@@ -2205,11 +2385,15 @@ async def handle_google_auth_command(update: Update, context: ContextTypes.DEFAU
     try:
         gmail_service = _get_gmail_service(context)
         await asyncio.to_thread(gmail_service.ensure_credentials)
+        drive_service = _get_drive_service(context)
+        await asyncio.to_thread(drive_service.ensure_credentials)
+        photos_service = _get_photos_service(context)
+        await asyncio.to_thread(photos_service.ensure_credentials)
     except Exception as exc:
         logger.warning("Google auth failed: %s", exc)
         await message.reply_text("Google authentication failed. Check logs for details.")
         return
-    await message.reply_text("Google authentication completed.")
+    await message.reply_text("Google authentication completed for Gmail, Drive, and Photos.")
 
 
 async def handle_reauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2394,6 +2578,15 @@ async def _route_and_handle_message(
             telegram_app=context.application,
         )
         return
+    if decision.intent == RouterIntent.WORKSPACE:
+        handled = await _handle_workspace_request(
+            context,
+            message,
+            message_text=message_text,
+            session_context=session_context,
+        )
+        if handled:
+            return
     if decision.intent == RouterIntent.GMAIL_INBOX:
         handled = await _handle_gmail_intelligent_request(
             context, message, intent=decision.intent, message_text=message_text

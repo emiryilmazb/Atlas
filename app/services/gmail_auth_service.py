@@ -21,16 +21,24 @@ DEFAULT_SCOPES = (
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/tasks",
+    "https://www.googleapis.com/auth/contacts",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/youtube.readonly",
+    "https://www.googleapis.com/auth/photoslibrary",
 )
 
 
-def parse_scopes(value: str | Iterable[str] | None) -> list[str]:
+def parse_scopes(
+    value: str | Iterable[str] | None,
+    default_scopes: Iterable[str] | None = None,
+) -> list[str]:
+    fallback = list(default_scopes or DEFAULT_SCOPES)
     if value is None:
-        return list(DEFAULT_SCOPES)
+        return fallback
     if isinstance(value, str):
         cleaned = [item.strip() for item in value.split(",") if item.strip()]
-        return cleaned or list(DEFAULT_SCOPES)
-    return [item for item in value if item]
+        return cleaned or fallback
+    return [item for item in value if item] or fallback
 
 
 def _default_token_path() -> Path:
@@ -45,12 +53,13 @@ class GmailAuthConfig:
     scopes: Iterable[str] | None = None
     oauth_flow: str = "local"
     open_browser: bool = True
+    default_scopes: Iterable[str] | None = None
 
 
 class GmailAuthService:
     def __init__(self, config: GmailAuthConfig) -> None:
         self._config = config
-        self._scopes = parse_scopes(config.scopes)
+        self._scopes = parse_scopes(config.scopes, config.default_scopes)
         token_path = config.token_path or str(_default_token_path())
         self._token_path = Path(token_path)
 
@@ -67,6 +76,9 @@ class GmailAuthService:
                 )
             except Exception as exc:
                 logger.warning("Failed to load Gmail token: %s", exc)
+        if creds and not creds.has_scopes(self._scopes):
+            logger.info("Stored token missing required scopes; reauthorization required.")
+            creds = None
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
             self._save_token(creds)

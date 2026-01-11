@@ -6,7 +6,7 @@ import re
 import time
 import zipfile
 import xml.etree.ElementTree as ET
-from typing import AsyncIterator, Callable, Optional
+from typing import Any, AsyncIterator, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,17 @@ class LLMClient:
         raise NotImplementedError
 
     def generate_suggestions(self, history_text: str) -> list[str]:
+        raise NotImplementedError
+
+    def generate_content(
+        self,
+        contents: Any,
+        *,
+        tools: list[Any] | None = None,
+        system_instruction: str | None = None,
+        response_modalities: Any = None,
+        use_default_tools: bool = True,
+    ):
         raise NotImplementedError
 
     async def stream_text(self, prompt: str, include_thoughts: bool = False) -> "AsyncIterator[StreamChunk]":
@@ -181,6 +192,38 @@ class GeminiClient(LLMClient):
         if getattr(response, "text", None):
             return response.text
         return ""
+
+    def generate_content(
+        self,
+        contents: Any,
+        *,
+        tools: list[Any] | None = None,
+        system_instruction: str | None = None,
+        response_modalities: Any = None,
+        use_default_tools: bool = True,
+    ):
+        from google.genai import types
+
+        config = None
+        if use_default_tools:
+            config = self.build_generate_config(response_modalities=response_modalities)
+        if config is None and (tools or system_instruction or response_modalities is not None):
+            config = types.GenerateContentConfig()
+        if config is not None:
+            existing_tools = list(getattr(config, "tools", None) or [])
+            if tools:
+                config.tools = existing_tools + list(tools)
+            elif existing_tools:
+                config.tools = existing_tools
+            if system_instruction:
+                config.system_instruction = system_instruction
+            if response_modalities is not None:
+                config.response_modalities = list(response_modalities)
+        return self._client.models.generate_content(
+            model=self._model,
+            contents=contents,
+            config=config,
+        )
 
     def generate_text_with_sources(self, prompt: str) -> tuple[str, list[SourceAttribution]]:
         if not prompt:
@@ -923,6 +966,18 @@ class NoOpLLMClient(LLMClient):
     def generate_with_file(self, prompt: str, file_path: str, mime_type: str | None = None) -> FileGenerationResult:
         logger.warning("LLM disabled; returning empty response.")
         return FileGenerationResult("", "LLM is not configured.")
+
+    def generate_content(
+        self,
+        contents: Any,
+        *,
+        tools: list[Any] | None = None,
+        system_instruction: str | None = None,
+        response_modalities: Any = None,
+        use_default_tools: bool = True,
+    ):
+        logger.warning("LLM disabled; returning empty response.")
+        return None
 
     async def stream_text(self, prompt: str, include_thoughts: bool = False) -> AsyncIterator[StreamChunk]:
         if False:  # pragma: no cover - keeps this as an async generator

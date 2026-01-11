@@ -5,6 +5,7 @@ from enum import Enum
 import json
 import logging
 import random
+import re
 import time
 from typing import Any
 
@@ -22,6 +23,7 @@ class RouterIntent(Enum):
     COMPUTER_USE = "COMPUTER_USE"
     IMAGE_GEN = "IMAGE_GEN"
     IMAGE_EDIT = "IMAGE_EDIT"
+    WORKSPACE = "WORKSPACE"
     GMAIL_INBOX = "GMAIL_INBOX"
     GMAIL_SUMMARY = "GMAIL_SUMMARY"
     GMAIL_SEARCH = "GMAIL_SEARCH"
@@ -127,6 +129,81 @@ _GMAIL_TOKENS = (
     "mailler",
     "maillerim",
 )
+_CALENDAR_TOKENS = (
+    "calendar",
+    "meeting",
+    "schedule",
+    "appointment",
+    "event",
+    "invite",
+    "review",
+    "agenda",
+    "takvim",
+    "toplanti",
+    "randevu",
+    "etkinlik",
+    "davet",
+    "takvime",
+    "takvimi",
+    "bulusma",
+)
+_TASK_TOKENS = (
+    "task",
+    "tasks",
+    "todo",
+    "to-do",
+    "reminder",
+    "remind",
+    "action item",
+    "checklist",
+    "follow up",
+    "gorev",
+    "gorevler",
+    "yapilacak",
+    "hatirlatma",
+    "hatirlat",
+    "is listesi",
+)
+_CONTACT_TOKENS = (
+    "contact",
+    "contacts",
+    "address book",
+    "phone",
+    "phone number",
+    "mobile",
+    "email address",
+    "contact info",
+    "contact information",
+    "rehber",
+    "kisi",
+    "kisiler",
+    "telefon",
+    "telefon numarasi",
+    "eposta adresi",
+)
+_DRIVE_TOKENS = (
+    "drive",
+    "google drive",
+    "gdrive",
+    "docs",
+    "doc",
+    "document",
+    "documents",
+    "sheets",
+    "sheet",
+    "slides",
+    "presentation",
+    "folder",
+)
+_PHOTOS_TOKENS = (
+    "google photos",
+    "photos",
+    "photo",
+    "album",
+    "albums",
+    "media item",
+    "media items",
+)
 _GMAIL_SUMMARY_TOKENS = (
     "summarize",
     "summary",
@@ -221,6 +298,7 @@ Choose exactly one intent:
 - COMPUTER_USE: requests to operate the computer, apps, or browser.
 - IMAGE_GEN: requests to generate a new image from text.
 - IMAGE_EDIT: requests to edit, transform, or analyze an image (image-to-image or vision).
+- WORKSPACE: requests to manage Google Drive, Google Calendar, Google Tasks, Google Contacts (People API), or Google Photos, or multi-step requests that mix Gmail with Drive/contacts/calendar/tasks/photos.
 - GMAIL_INBOX: requests to check inbox or list recent emails.
 - GMAIL_SUMMARY: requests to summarize recent emails.
 - GMAIL_SEARCH: requests to search emails with a query.
@@ -234,6 +312,10 @@ Guidance:
 - If the user wants to take an action on the computer (including setting wallpaper), choose COMPUTER_USE.
 - If the user asks for time-sensitive factual info (exchange rates, news, weather), choose CHAT. The assistant can use built-in Google Search tools, so do not use COMPUTER_USE just to browse.
 - If the user asks for charts, graphs, or plots, choose CHAT. The assistant can generate charts without computer control.
+- If the user asks to search Drive, list folders, read documents, or combine email with Drive, choose WORKSPACE.
+- If the user asks to search Google Photos, list albums, or organize photo libraries, choose WORKSPACE.
+- If the user asks to schedule meetings, create calendar events, manage tasks, or combine email with calendar/tasks, choose WORKSPACE.
+- If the user needs contact details (emails/phone numbers/birthdays) to complete a task, choose WORKSPACE.
 - If the user refers to "this/that" and context has a last_image, assume the reference is the last image.
 
 Context JSON:
@@ -243,7 +325,7 @@ Has image: {str(has_image).lower()}
 User message: {message_text}
 
 Return ONLY JSON with this shape:
-{{ "intent": "CHAT|COMPUTER_USE|IMAGE_GEN|IMAGE_EDIT|GMAIL_INBOX|GMAIL_SUMMARY|GMAIL_SEARCH|GMAIL_DRAFT|GMAIL_SEND|GMAIL_QUESTION", "reason": "<short reason>" }}
+{{ "intent": "CHAT|COMPUTER_USE|IMAGE_GEN|IMAGE_EDIT|WORKSPACE|GMAIL_INBOX|GMAIL_SUMMARY|GMAIL_SEARCH|GMAIL_DRAFT|GMAIL_SEND|GMAIL_QUESTION", "reason": "<short reason>" }}
 """.strip()
 
 
@@ -294,6 +376,14 @@ def _fallback_intent(
         return RouterDecision(intent=RouterIntent.IMAGE_EDIT, reason="fallback:edit")
     if _contains_any(normalized, _IMAGE_GEN_TOKENS):
         return RouterDecision(intent=RouterIntent.IMAGE_GEN, reason="fallback:gen")
+    if _contains_any(normalized, _CALENDAR_TOKENS) or _contains_any(normalized, _TASK_TOKENS):
+        return RouterDecision(intent=RouterIntent.WORKSPACE, reason="fallback:workspace")
+    if _contains_any(normalized, _DRIVE_TOKENS):
+        return RouterDecision(intent=RouterIntent.WORKSPACE, reason="fallback:drive")
+    if _contains_any(normalized, _PHOTOS_TOKENS):
+        return RouterDecision(intent=RouterIntent.WORKSPACE, reason="fallback:photos")
+    if _contains_any(normalized, _CONTACT_TOKENS):
+        return RouterDecision(intent=RouterIntent.WORKSPACE, reason="fallback:contacts")
     if _contains_any(normalized, _GMAIL_TOKENS):
         return _fallback_gmail_intent(normalized)
     if _contains_any(normalized, _COMPUTER_USE_TOKENS):
@@ -307,6 +397,8 @@ def _fallback_intent(
 
 def _fallback_gmail_intent(normalized: str) -> RouterDecision:
     if _contains_any(normalized, _GMAIL_SEND_TOKENS):
+        if not _contains_email(normalized) and _contains_any(normalized, _CONTACT_TOKENS):
+            return RouterDecision(intent=RouterIntent.WORKSPACE, reason="fallback:gmail_contact_send")
         return RouterDecision(intent=RouterIntent.GMAIL_SEND, reason="fallback:gmail_send")
     if _contains_any(normalized, _GMAIL_SUMMARY_TOKENS):
         return RouterDecision(intent=RouterIntent.GMAIL_SUMMARY, reason="fallback:gmail_summary")
@@ -321,6 +413,10 @@ def _fallback_gmail_intent(normalized: str) -> RouterDecision:
 
 def _contains_any(text: str, tokens: tuple[str, ...]) -> bool:
     return any(token in text for token in tokens)
+
+
+def _contains_email(text: str) -> bool:
+    return bool(re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", text))
 
 
 def _has_recent_images(session_context: dict[str, Any] | None) -> bool:
