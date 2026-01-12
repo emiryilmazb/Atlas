@@ -14,6 +14,7 @@ class Settings:
     log_level: str = "INFO"
     sqlite_db_path: str = ""
     memory_enabled: bool = True
+    memory_aggressive_inference: bool = True
     memory_summary_every_n_user_msg: int = 12
     memory_retrieval_top_k: int = 5
     embedding_backend: str = "sentence_transformers"
@@ -96,6 +97,7 @@ def get_settings() -> Settings:
         ),
         sqlite_db_path=os.getenv("SQLITE_DB_PATH", ""),
         memory_enabled=_env_flag("MEMORY_ENABLED", True),
+        memory_aggressive_inference=_env_flag("MEMORY_AGGRESSIVE_INFERENCE", True),
         memory_summary_every_n_user_msg=_env_int("MEMORY_SUMMARY_EVERY_N_USER_MSG", 12),
         memory_retrieval_top_k=_env_int("MEMORY_RETRIEVAL_TOP_K", 5),
         embedding_backend=os.getenv("EMBEDDING_BACKEND", "sentence_transformers"),

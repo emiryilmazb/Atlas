@@ -5,6 +5,7 @@ import numpy as np
 from app.memory.embeddings import cosine_similarity, deserialize_embedding, serialize_embedding
 from app.memory.long_term import (
     _apply_profile_removals,
+    _INFERRED_TTL_DAYS,
     _merge_profile_facts,
     _prune_expired_facts,
     extract_json_payload,
@@ -152,3 +153,78 @@ def test_prune_expired_facts() -> None:
     remaining = _prune_expired_facts(facts, now=now)
     values = sorted([item["value"] for item in remaining])
     assert values == ["direct", "ml"]
+
+
+def test_merge_profile_facts_allows_inference_for_preferences() -> None:
+    new_facts = [
+        {
+            "key": "preferences.communication.tone",
+            "value": "direct",
+            "evidence": "",
+            "importance": 0.4,
+            "confidence": 0.7,
+            "ttl_days": 0,
+        }
+    ]
+    updated = _merge_profile_facts(
+        [],
+        new_facts,
+        "Please summarize the key points.",
+        allow_missing_evidence=True,
+        source_override="llm",
+    )
+    assert len(updated) == 1
+    assert updated[0]["inferred"] is True
+    assert updated[0]["ttl_days"] == _INFERRED_TTL_DAYS
+
+
+def test_merge_profile_facts_rejects_inference_for_identity() -> None:
+    new_facts = [
+        {
+            "key": "identity.name",
+            "value": "Ayse",
+            "evidence": "",
+            "importance": 0.9,
+            "confidence": 0.9,
+            "ttl_days": 0,
+        }
+    ]
+    updated = _merge_profile_facts(
+        [],
+        new_facts,
+        "Nice to meet you.",
+        allow_missing_evidence=True,
+        source_override="llm",
+    )
+    assert updated == []
+
+
+def test_merge_profile_facts_allows_inference_for_dislikes_and_constraints() -> None:
+    new_facts = [
+        {
+            "key": "dislikes.topic",
+            "value": "spam",
+            "evidence": "",
+            "importance": 0.4,
+            "confidence": 0.7,
+            "ttl_days": 0,
+        },
+        {
+            "key": "constraints.avoid",
+            "value": "phone calls",
+            "evidence": "",
+            "importance": 0.5,
+            "confidence": 0.7,
+            "ttl_days": 0,
+        },
+    ]
+    updated = _merge_profile_facts(
+        [],
+        new_facts,
+        "Please keep it asynchronous.",
+        allow_missing_evidence=True,
+        source_override="llm",
+    )
+    assert len(updated) == 2
+    assert all(item.get("inferred") is True for item in updated)
+    assert all(item.get("ttl_days") == _INFERRED_TTL_DAYS for item in updated)

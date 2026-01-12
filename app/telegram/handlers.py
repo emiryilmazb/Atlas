@@ -2999,7 +2999,8 @@ async def handle_profile_command(update: Update, context: ContextTypes.DEFAULT_T
         conf_label = ""
         if isinstance(confidence, (int, float)):
             conf_label = f" (conf={confidence:.2f})"
-        lines.append(f"- {fact_id}: {key} = {value}{conf_label}")
+        inferred_label = " inferred" if item.get("inferred") else ""
+        lines.append(f"- {fact_id}: {key} = {value}{conf_label}{inferred_label}")
     await message.reply_text("\n".join(lines))
 
 
