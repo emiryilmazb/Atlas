@@ -1,6 +1,6 @@
-# ApplyWise (Atlas)
+# Atlas
 
-ApplyWise (codename Atlas) is a local, Telegram-first AI agent that automates job applications, desktop workflows, and Google Workspace tasks using Gemini. It runs on your machine, keeps human approvals in the loop, and stores memory in SQLite so it can keep context between sessions.
+Atlas is a local, Telegram-first AI agent that automates job applications, desktop workflows, and Google Workspace tasks using Gemini. It runs on your machine, keeps human approvals in the loop, and stores memory in SQLite so it can keep context between sessions.
 
 ## What it can do
 
@@ -37,7 +37,7 @@ ApplyWise (codename Atlas) is a local, Telegram-first AI agent that automates jo
 1. Clone and enter the repo.
    ```bash
    git clone <repo-url>
-   cd ApplyWise
+   cd Atlas
    ```
 
 2. Create and activate a virtual environment.
