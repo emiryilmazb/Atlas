@@ -12,6 +12,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
 class Settings:
     app_name: str = "Atlas"
     log_level: str = "INFO"
+    httpx_log_path_only: bool = False
     sqlite_db_path: str = ""
     memory_enabled: bool = True
     memory_aggressive_inference: bool = True
@@ -95,6 +96,7 @@ def get_settings() -> Settings:
             os.getenv("ATLAS_LOG_LEVEL")
             or os.getenv("APPLYWISE_LOG_LEVEL", "INFO")
         ),
+        httpx_log_path_only=_env_flag("HTTPX_LOG_PATH_ONLY", False),
         sqlite_db_path=os.getenv("SQLITE_DB_PATH", ""),
         memory_enabled=_env_flag("MEMORY_ENABLED", True),
         memory_aggressive_inference=_env_flag("MEMORY_AGGRESSIVE_INFERENCE", True),
