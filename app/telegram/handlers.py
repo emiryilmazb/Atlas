@@ -135,6 +135,30 @@ _IMAGE_COMPARE_TOKENS = (
     "hangisini",
     "tercih",
 )
+_IMAGE_TRANSFER_TOKENS = (
+    "apply",
+    "swap",
+    "replace",
+    "transfer",
+    "copy",
+    "paste",
+    "move",
+    "overlay",
+    "merge",
+    "blend",
+    "koy",
+    "tak",
+    "uygula",
+    "aktar",
+    "yerine",
+    "degistir",
+    "birlestir",
+    "yerlestir",
+    "yap",
+)
+_MAX_MULTI_IMAGE_COUNT = 10
+_IMAGE_DISAMBIGUATION_LIMIT = 10
+_MEDIA_GROUP_FLUSH_DELAY = 1.0
 _CHAT_CONTEXT_LIMIT = 20
 _SUGGESTION_PREFIX = "SUGG:"
 _TELEGRAM_TEXT_CHUNK = 3500
@@ -227,7 +251,7 @@ You classify the user's request about an image.
 Return ONLY JSON with this shape:
 {{"intent": "ANALYZE|EDIT|UNKNOWN"}}
 
-ANALYZE = user asks for evaluation, description, suitability, or feedback.
+ANALYZE = user asks for evaluation, description, suitability, feedback, or comparison.
 EDIT = user asks to change, modify, add/remove elements, or transform the image.
 UNKNOWN = unclear.
 
@@ -247,6 +271,33 @@ class PendingDocument:
 
 
 _PENDING_DOCUMENTS: dict[str, PendingDocument] = {}
+_PENDING_MEDIA_GROUPS: dict[str, "PendingMediaGroup"] = {}
+_PENDING_MEDIA_GROUPS_LOCK = asyncio.Lock()
+
+
+@dataclass
+class PendingMediaGroup:
+    update: Update
+    message: object
+    user_id: str | None
+    media_group_id: str
+    items: list[object]
+    caption: str | None
+    created_at: float
+    task: asyncio.Task | None = None
+
+
+@dataclass
+class PendingImageRequest:
+    prompt: str
+    expected_count: int
+    image_paths: list[str]
+    created_at: float
+
+
+_PENDING_IMAGE_REQUESTS: dict[str, "PendingImageRequest"] = {}
+_PENDING_IMAGE_REQUESTS_LOCK = asyncio.Lock()
+_PENDING_IMAGE_TTL_SECONDS = 10 * 60
 
 
 def _resolve_user_id(update: Update) -> str | None:
@@ -1737,6 +1788,19 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = _resolve_user_id(update)
     caption = message.caption or ""
     if caption:
+        await _clear_pending_image_request(user_id, message.chat_id)
+    media_group_id = getattr(message, "media_group_id", None)
+    if media_group_id:
+        await _queue_media_group_item(
+            update=update,
+            context=context,
+            media_group_id=str(media_group_id),
+            media=media,
+            caption=caption,
+            user_id=user_id,
+        )
+        return
+    if caption:
         memory_text = _memory_text(caption)
         if user_id:
             if should_reset_context(user_id, memory_text):
@@ -1755,6 +1819,92 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if handled:
             return
 
+    if not caption.strip():
+        photo_size = getattr(media, "file_size", None)
+        if photo_size and photo_size > GEMINI_FLASH_MAX_INLINE_IMAGE_BYTES:
+            await message.reply_text(
+                _file_too_large_message(
+                    "Image", GEMINI_FLASH_MAX_INLINE_IMAGE_BYTES)
+            )
+            return
+        try:
+            reference_path = await _download_photo_to_temp(media, message)
+        except Exception as exc:  # pragma: no cover - network/IO errors
+            logger.error("Photo download failed: %s", exc)
+            await message.reply_text("Photo download failed. Please try again.")
+            return
+        record_image_result(
+            user_id,
+            reference_path,
+            None,
+            source="uploaded",
+        )
+        pending_request, ready_paths = await _append_pending_images(
+            user_id,
+            message.chat_id,
+            [reference_path],
+        )
+        if pending_request:
+            if ready_paths:
+                llm_client = context.application.bot_data.get("llm_client")
+                image_client = context.application.bot_data.get("image_client")
+                settings = _resolve_settings(context)
+                await _handle_image_edit(
+                    message,
+                    image_client,
+                    llm_client,
+                    pending_request.prompt,
+                    user_id=user_id,
+                    photo=None,
+                    session_context=get_session_context(user_id),
+                    settings=settings,
+                    telegram_app=context.application,
+                    reference_paths_override=ready_paths,
+                )
+            return
+        session_context = get_session_context(user_id)
+        last_message = None
+        if session_context:
+            memory = session_context.get("short_term_memory")
+            if isinstance(memory, list) and memory:
+                last_message = str(memory[-1])
+        if last_message and _is_image_request_without_caption(last_message):
+            expected_count = _resolve_expected_image_count(last_message)
+            if expected_count >= 2:
+                pending_request = await _set_pending_image_request(
+                    user_id,
+                    message.chat_id,
+                    last_message,
+                    expected_count,
+                    seed_paths=[reference_path],
+                )
+                if pending_request and len(pending_request.image_paths) < expected_count:
+                    await message.reply_text(
+                        _format_pending_image_message(
+                            expected_count,
+                            len(pending_request.image_paths),
+                        )
+                    )
+                return
+            llm_client = context.application.bot_data.get("llm_client")
+            image_client = context.application.bot_data.get("image_client")
+            settings = _resolve_settings(context)
+            await _handle_image_edit(
+                message,
+                image_client,
+                llm_client,
+                last_message,
+                user_id=user_id,
+                photo=None,
+                session_context=session_context,
+                settings=settings,
+                telegram_app=context.application,
+                reference_paths_override=[reference_path],
+            )
+            return
+        await message.reply_text("Photo received. Tell me what you'd like to do with it.")
+        return
+
     await _route_and_handle_message(
         update=update,
         context=context,
@@ -1764,6 +1914,254 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         has_image=True,
         photo=media,
         pending=pending,
+    )
+
+
+def _media_group_key(user_id: str | None, chat_id: object, media_group_id: str) -> str:
+    return f"{user_id or chat_id}:{media_group_id}"
+
+
+def _pending_image_key(user_id: str | None, chat_id: object) -> str:
+    return str(user_id or chat_id)
+
+
+def _is_pending_image_request_stale(request: PendingImageRequest) -> bool:
+    return (time.time() - request.created_at) > _PENDING_IMAGE_TTL_SECONDS
+
+
+async def _append_pending_images(
+    user_id: str | None,
+    chat_id: object,
+    image_paths: list[str],
+) -> tuple[PendingImageRequest | None, list[str] | None]:
+    if not image_paths:
+        return None, None
+    key = _pending_image_key(user_id, chat_id)
+    async with _PENDING_IMAGE_REQUESTS_LOCK:
+        pending = _PENDING_IMAGE_REQUESTS.get(key)
+        if pending and _is_pending_image_request_stale(pending):
+            _PENDING_IMAGE_REQUESTS.pop(key, None)
+            pending = None
+        if pending is None:
+            return None, None
+        pending.image_paths.extend(image_paths)
+        if len(pending.image_paths) >= pending.expected_count:
+            selected = pending.image_paths[: pending.expected_count]
+            _PENDING_IMAGE_REQUESTS.pop(key, None)
+            return pending, selected
+        return pending, None
+
+
+async def _set_pending_image_request(
+    user_id: str | None,
+    chat_id: object,
+    prompt: str,
+    expected_count: int,
+    seed_paths: list[str] | None = None,
+) -> PendingImageRequest | None:
+    if expected_count <= 0:
+        return None
+    key = _pending_image_key(user_id, chat_id)
+    pending = PendingImageRequest(
+        prompt=prompt,
+        expected_count=expected_count,
+        image_paths=list(seed_paths or []),
+        created_at=time.time(),
+    )
+    async with _PENDING_IMAGE_REQUESTS_LOCK:
+        _PENDING_IMAGE_REQUESTS[key] = pending
+    return pending
+
+
+async def _clear_pending_image_request(user_id: str | None, chat_id: object) -> None:
+    key = _pending_image_key(user_id, chat_id)
+    async with _PENDING_IMAGE_REQUESTS_LOCK:
+        _PENDING_IMAGE_REQUESTS.pop(key, None)
+
+
+async def _queue_media_group_item(
+    *,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    media_group_id: str,
+    media,
+    caption: str,
+    user_id: str | None,
+) -> None:
+    message = update.message
+    if message is None:
+        return
+    key = _media_group_key(user_id, message.chat_id, media_group_id)
+    async with _PENDING_MEDIA_GROUPS_LOCK:
+        group = _PENDING_MEDIA_GROUPS.get(key)
+        if group is None:
+            group = PendingMediaGroup(
+                update=update,
+                message=message,
+                user_id=user_id,
+                media_group_id=media_group_id,
+                items=[],
+                caption=None,
+                created_at=time.time(),
+            )
+            _PENDING_MEDIA_GROUPS[key] = group
+        group.items.append(media)
+        if caption and not group.caption:
+            group.caption = caption
+        group.update = update
+        group.message = message
+        if group.task and not group.task.done():
+            group.task.cancel()
+        group.task = asyncio.create_task(_flush_media_group(key, context))
+
+
+async def _flush_media_group(key: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await asyncio.sleep(_MEDIA_GROUP_FLUSH_DELAY)
+    except asyncio.CancelledError:
+        return
+    async with _PENDING_MEDIA_GROUPS_LOCK:
+        group = _PENDING_MEDIA_GROUPS.pop(key, None)
+    if group is None:
+        return
+    await _process_media_group(group, context)
+
+
+async def _process_media_group(
+    group: PendingMediaGroup,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = group.message
+    if message is None:
+        return
+    caption = (group.caption or "").strip()
+    user_id = group.user_id
+    if caption:
+        await _clear_pending_image_request(user_id, message.chat_id)
+        memory_text = _memory_text(caption)
+        if user_id:
+            if should_reset_context(user_id, memory_text):
+                clear_session(user_id)
+            if not is_anonymous_mode(user_id):
+                record_user_message(user_id, memory_text)
+
+    agent_context = context.application.bot_data.get("agent_context")
+    if agent_context is None:
+        await message.reply_text("Agent is not ready. Please try again later.")
+        return
+
+    pending = agent_context.pending_request
+    if pending is not None and pending.category != "startup":
+        handled = await _handle_pending_reply(message, agent_context, caption)
+        if handled:
+            return
+
+    if len(group.items) > _MAX_MULTI_IMAGE_COUNT:
+        await message.reply_text(f"Please send up to {_MAX_MULTI_IMAGE_COUNT} images.")
+        return
+
+    image_paths: list[str] = []
+    for media in group.items:
+        photo_size = getattr(media, "file_size", None)
+        if photo_size and photo_size > GEMINI_FLASH_MAX_INLINE_IMAGE_BYTES:
+            await message.reply_text(
+                _file_too_large_message(
+                    "Image", GEMINI_FLASH_MAX_INLINE_IMAGE_BYTES)
+            )
+            return
+        try:
+            reference_path = await _download_photo_to_temp(media, message)
+        except Exception as exc:  # pragma: no cover - network/IO errors
+            logger.error("Photo download failed: %s", exc)
+            await message.reply_text("Photo download failed. Please try again.")
+            return
+        record_image_result(
+            user_id,
+            reference_path,
+            caption or None,
+            source="uploaded",
+        )
+        image_paths.append(reference_path)
+
+    if not caption:
+        pending_request, ready_paths = await _append_pending_images(
+            user_id,
+            message.chat_id,
+            image_paths,
+        )
+        if pending_request:
+            if ready_paths:
+                llm_client = context.application.bot_data.get("llm_client")
+                image_client = context.application.bot_data.get("image_client")
+                settings = _resolve_settings(context)
+                await _handle_image_edit(
+                    message,
+                    image_client,
+                    llm_client,
+                    pending_request.prompt,
+                    user_id=user_id,
+                    photo=None,
+                    session_context=get_session_context(user_id),
+                    settings=settings,
+                    telegram_app=context.application,
+                    reference_paths_override=ready_paths,
+                )
+            return
+
+    session_context = get_session_context(user_id)
+    if not caption:
+        last_message = None
+        if session_context:
+            memory = session_context.get("short_term_memory")
+            if isinstance(memory, list) and memory:
+                last_message = str(memory[-1])
+        if last_message and _is_image_request_without_caption(last_message):
+            expected_count = _resolve_expected_image_count(last_message)
+            if expected_count >= 2 and len(image_paths) < expected_count:
+                pending_request = await _set_pending_image_request(
+                    user_id,
+                    message.chat_id,
+                    last_message,
+                    expected_count,
+                    seed_paths=image_paths,
+                )
+                if pending_request and len(pending_request.image_paths) < expected_count:
+                    await message.reply_text(
+                        _format_pending_image_message(
+                            expected_count,
+                            len(pending_request.image_paths),
+                        )
+                    )
+                return
+            llm_client = context.application.bot_data.get("llm_client")
+            image_client = context.application.bot_data.get("image_client")
+            settings = _resolve_settings(context)
+            await _handle_image_edit(
+                message,
+                image_client,
+                llm_client,
+                last_message,
+                user_id=user_id,
+                photo=None,
+                session_context=session_context,
+                settings=settings,
+                telegram_app=context.application,
+                reference_paths_override=image_paths,
+            )
+            return
+        await message.reply_text("Photo received. Tell me what you'd like to do with it.")
+        return
+
+    await _route_and_handle_message(
+        update=group.update,
+        context=context,
+        agent_context=agent_context,
+        user_id=user_id,
+        message_text=caption,
+        has_image=True,
+        photo=None,
+        pending=pending,
+        reference_paths_override=image_paths,
     )
 
 
@@ -2505,6 +2903,7 @@ async def _route_and_handle_message(
     photo,
     source_meta: dict[str, str | None] | None = None,
     pending,
+    reference_paths_override: list[str] | None = None,
 ) -> None:
     message = update.message
     if message is None and update.callback_query is not None:
@@ -2536,6 +2935,14 @@ async def _route_and_handle_message(
     ):
         decision = RouterDecision(
             intent=RouterIntent.IMAGE_EDIT, reason="override:analysis_last_image")
+    if (
+        not has_image
+        and session_context
+        and _has_recent_images(session_context)
+        and _looks_like_cross_image_edit(message_text)
+    ):
+        decision = RouterDecision(
+            intent=RouterIntent.IMAGE_EDIT, reason="override:edit_last_image")
 
     if pending is not None and pending.category == "startup" and _is_startup_reply(message_text):
         await _handle_pending_reply(message, agent_context, message_text)
@@ -2576,6 +2983,7 @@ async def _route_and_handle_message(
             source_meta=source_meta,
             settings=settings,
             telegram_app=context.application,
+            reference_paths_override=reference_paths_override,
         )
         return
     if decision.intent == RouterIntent.WORKSPACE:
@@ -3305,6 +3713,7 @@ async def _handle_image_edit(
     source_meta: dict[str, str | None] | None = None,
     settings,
     telegram_app,
+    reference_paths_override: list[str] | None = None,
 ) -> None:
     if image_client is None:
         await message.reply_text("Gemini image model is not configured. Please set GEMINI_API_KEY.")
@@ -3316,7 +3725,11 @@ async def _handle_image_edit(
     reply_note = _build_reply_context_note(message, user_id)
     llm_prompt_text = _inject_reply_context(prompt_text, reply_note)
 
+    has_new_upload = photo is not None or reference_paths_override is not None
     reference_path = None
+    reference_paths: list[str] | None = None
+    if reference_paths_override:
+        reference_paths = [str(path) for path in reference_paths_override if path]
     if photo is not None:
         photo_size = getattr(photo, "file_size", None)
         if photo_size and photo_size > GEMINI_FLASH_MAX_INLINE_IMAGE_BYTES:
@@ -3337,24 +3750,74 @@ async def _handle_image_edit(
             prompt_text or None,
             source="uploaded",
         )
-    else:
-        reference_path, _, ambiguous = _resolve_image_reference(
-            prompt_text, session_context
+        session_context = get_session_context(user_id) or session_context
+
+    if reference_paths_override is None:
+        reference_paths, ambiguous = _resolve_multi_image_references(
+            prompt_text,
+            session_context,
+            max_images=_MAX_MULTI_IMAGE_COUNT,
         )
         if ambiguous:
             await message.reply_text(
                 _build_image_disambiguation_message(session_context)
             )
             return
-        if not reference_path or not Path(reference_path).exists():
-            await message.reply_text("Please send the image you want to edit.")
-            return
+        if reference_paths is None and reference_path is None:
+            reference_path, _, ambiguous = _resolve_image_reference(
+                prompt_text, session_context
+            )
+            if ambiguous:
+                await message.reply_text(
+                    _build_image_disambiguation_message(session_context)
+                )
+                return
 
-    validation_error = await _validate_image_for_gemini(
+    if reference_paths is None and (not reference_path or not Path(reference_path).exists()):
+        expected_count = _resolve_expected_image_count(prompt_text)
+        if expected_count >= 2:
+            await _set_pending_image_request(
+                user_id,
+                message.chat_id,
+                prompt_text,
+                expected_count,
+            )
+            await message.reply_text(_format_pending_image_message(expected_count, 0))
+            return
+        await message.reply_text("Please send the image you want to edit.")
+        return
+
+    normalized_prompt = _normalize_text(prompt_text)
+    available = reference_paths or ([reference_path] if reference_path else [])
+    requested_count = _extract_image_count(normalized_prompt)
+    expected_count = None
+    if requested_count:
+        expected_count = min(requested_count, _MAX_MULTI_IMAGE_COUNT)
+    else:
+        inferred_count = _resolve_expected_image_count(normalized_prompt, default=0)
+        if inferred_count >= 2:
+            expected_count = inferred_count
+    if expected_count and len(available) < expected_count:
+        seed_paths = available if has_new_upload else []
+        await _set_pending_image_request(
+            user_id,
+            message.chat_id,
+            prompt_text,
+            expected_count,
+            seed_paths=seed_paths,
+        )
+        await message.reply_text(
+            _format_pending_image_message(expected_count, len(seed_paths))
+        )
+        return
+
+    validation_error = await _validate_images_for_gemini(
         llm_client,
         prompt_text,
-        reference_path,
-        getattr(photo, "mime_type", None) if photo is not None else None,
+        available,
+        getattr(photo, "mime_type", None)
+        if photo is not None and not reference_paths
+        else None,
     )
     if validation_error:
         await message.reply_text(validation_error)
@@ -3368,16 +3831,20 @@ async def _handle_image_edit(
             role="user",
             content=prompt_text,
             timestamp=_timestamp_from_message(message),
-            file_path=reference_path,
-            file_type=mimetypes.guess_type(reference_path)[
-                0] if reference_path else None,
+            file_path=reference_path or (reference_paths[0] if reference_paths else None),
+            file_type=mimetypes.guess_type(reference_path or reference_paths[0])[0]
+            if (reference_path or reference_paths) else None,
             **_user_source_kwargs(message, source_meta),
         )
 
     if await _is_analysis_request_with_llm(llm_client, llm_prompt_text):
         streaming_enabled = bool(getattr(settings, "streaming_enabled", False))
         show_thoughts = bool(getattr(settings, "show_thoughts", True))
-        if streaming_enabled and hasattr(llm_client, "stream_with_image"):
+        if (
+            streaming_enabled
+            and hasattr(llm_client, "stream_with_image")
+            and not (reference_paths and len(reference_paths) > 1)
+        ):
             async def _stream_runner() -> None:
                 try:
                     live_message = await message.reply_text(
@@ -3399,13 +3866,13 @@ async def _handle_image_edit(
                         return await asyncio.to_thread(
                             image_client.analyze_image,
                             llm_prompt_text,
-                            reference_path,
+                            reference_path or (reference_paths[0] if reference_paths else ""),
                         )
 
                     result = await handler.stream_chunks(
                         llm_client.stream_with_image(
                             llm_prompt_text,
-                            reference_path,
+                            reference_path or (reference_paths[0] if reference_paths else ""),
                             include_thoughts=show_thoughts,
                         ),
                         recovery=_recover,
@@ -3446,11 +3913,18 @@ async def _handle_image_edit(
             telegram_app.create_task(_stream_runner())
             return
         try:
-            response_text = await asyncio.to_thread(
-                image_client.analyze_image,
-                llm_prompt_text,
-                reference_path,
-            )
+            if reference_paths and len(reference_paths) > 1:
+                response_text = await asyncio.to_thread(
+                    image_client.analyze_images,
+                    llm_prompt_text,
+                    reference_paths,
+                )
+            else:
+                response_text = await asyncio.to_thread(
+                    image_client.analyze_image,
+                    llm_prompt_text,
+                    reference_path or (reference_paths[0] if reference_paths else ""),
+                )
         except Exception as exc:  # pragma: no cover - network/proxy errors
             logger.error("Image analysis failed: %s", exc)
             await message.reply_text("Image analysis failed. Please try again.")
@@ -3536,7 +4010,12 @@ async def _handle_image_edit(
 
     streaming_enabled = bool(getattr(settings, "streaming_enabled", False))
     show_thoughts = bool(getattr(settings, "show_thoughts", True))
-    if streaming_enabled and show_thoughts and hasattr(image_client, "stream_edit_image"):
+    if (
+        streaming_enabled
+        and show_thoughts
+        and hasattr(image_client, "stream_edit_image")
+        and not (reference_paths and len(reference_paths) > 1)
+    ):
         async def _stream_runner() -> None:
             try:
                 live_message = await message.reply_text(
@@ -3607,18 +4086,32 @@ async def _handle_image_edit(
         return
 
     try:
-        image_bytes = await _retry_image_bytes(
-            lambda: asyncio.to_thread(
-                image_client.edit_image,
-                llm_prompt_text,
-                reference_path,
-            ),
-            label="Image edit",
-            message=message,
-            attempts=_STREAM_RETRY_ATTEMPTS,
-            base_delay=_STREAM_RETRY_BASE_DELAY,
-            max_delay=_STREAM_RETRY_MAX_DELAY,
-        )
+        if reference_paths and len(reference_paths) > 1:
+            image_bytes = await _retry_image_bytes(
+                lambda: asyncio.to_thread(
+                    image_client.edit_images,
+                    llm_prompt_text,
+                    reference_paths,
+                ),
+                label="Image edit",
+                message=message,
+                attempts=_STREAM_RETRY_ATTEMPTS,
+                base_delay=_STREAM_RETRY_BASE_DELAY,
+                max_delay=_STREAM_RETRY_MAX_DELAY,
+            )
+        else:
+            image_bytes = await _retry_image_bytes(
+                lambda: asyncio.to_thread(
+                    image_client.edit_image,
+                    llm_prompt_text,
+                    reference_path or (reference_paths[0] if reference_paths else ""),
+                ),
+                label="Image edit",
+                message=message,
+                attempts=_STREAM_RETRY_ATTEMPTS,
+                base_delay=_STREAM_RETRY_BASE_DELAY,
+                max_delay=_STREAM_RETRY_MAX_DELAY,
+            )
     except Exception as exc:  # pragma: no cover - network/proxy errors
         logger.error("Image edit failed: %s", exc)
         await _safe_reply_text(
@@ -4900,7 +5393,7 @@ def _resolve_image_reference(
     normalized = _normalize_text(message_text or "")
     index = _extract_image_reference_index(normalized)
     if index is not None:
-        selected = _select_image_by_recency(images, index)
+        selected = _select_image_by_position(images, index)
         if selected:
             return selected.get("path"), selected.get("summary"), False
     if _mentions_first_image(normalized):
@@ -4925,21 +5418,36 @@ def _select_image_by_recency(images: list[dict], index: int) -> dict | None:
         return None
     return images[-index]
 
+def _select_image_by_position(images: list[dict], index: int) -> dict | None:
+    if index <= 0:
+        return None
+    if index > len(images):
+        return None
+    return images[index - 1]
+
 
 def _extract_image_reference_index(text: str) -> int | None:
+    indexes = _extract_image_reference_indexes(text)
+    return indexes[0] if indexes else None
+
+
+def _extract_image_reference_indexes(text: str) -> list[int]:
+    image_tokens = r"(?:image|photo|picture|foto|fotograf|resim|gorsel)\w*"
+    matches: list[tuple[int, int]] = []
     match = re.search(r"\b(\d+)\s+(?:previous|back|onceki)\b", text)
     if match:
-        return int(match.group(1)) + 1
-    match = re.search(r"\b(\d+)\s*(?:image|photo|picture)\b", text)
-    if match:
-        return int(match.group(1))
-    match = re.search(r"\b(?:image|photo|picture)\s*(\d+)\b", text)
-    if match:
-        return int(match.group(1))
+        matches.append((match.start(), int(match.group(1)) + 1))
+    for match in re.finditer(rf"\b(\d+)(?:st|nd|rd|th|\.)?\s*{image_tokens}\b", text):
+        matches.append((match.start(), int(match.group(1))))
+    for match in re.finditer(rf"\b{image_tokens}\s*(\d+)(?:st|nd|rd|th|\.)?\b", text):
+        matches.append((match.start(), int(match.group(1))))
     for word, index in _ORDINAL_IMAGE_TOKENS.items():
-        if re.search(rf"\b{re.escape(word)}\b", text):
-            return index
-    return None
+        for match in re.finditer(rf"\b{re.escape(word)}\b", text):
+            matches.append((match.start(), index))
+    if not matches:
+        return []
+    matches.sort(key=lambda item: item[0])
+    return [index for _, index in matches]
 
 
 def _mentions_last_image(text: str) -> bool:
@@ -4975,15 +5483,17 @@ def _build_image_disambiguation_message(session_context: dict | None) -> str:
     images = _get_recent_images(session_context)
     if not images:
         return "Please send the image you want to edit."
+    total = len(images)
+    start = max(0, total - _IMAGE_DISAMBIGUATION_LIMIT)
     lines = [
         "I found multiple images. Which one should I use?",
-        "1=latest, 2=previous, 3=two back",
+        f"Use a number from 1 to {total} (1=oldest, {total}=latest).",
     ]
-    for index, image in enumerate(reversed(images[-5:]), start=1):
+    for index, image in enumerate(images[start:], start=start + 1):
         summary = _format_recent_image_summary(image)
         label = summary or "image"
         lines.append(f"{index}) {label}")
-    lines.append("You can reply with 'latest', 'previous', or a number.")
+    lines.append("You can reply with 'latest/son', 'previous/onceki', or a number.")
     return "\n".join(lines)
 
 
@@ -4998,6 +5508,39 @@ _ORDINAL_IMAGE_TOKENS = {
     "eighth": 8,
     "ninth": 9,
     "tenth": 10,
+    "ilk": 1,
+    "birinci": 1,
+    "ikinci": 2,
+    "ucuncu": 3,
+    "dorduncu": 4,
+    "besinci": 5,
+    "altinci": 6,
+    "yedinci": 7,
+    "sekizinci": 8,
+    "dokuzuncu": 9,
+    "onuncu": 10,
+}
+_CARDINAL_IMAGE_TOKENS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "bir": 1,
+    "iki": 2,
+    "uc": 3,
+    "dort": 4,
+    "bes": 5,
+    "alti": 6,
+    "yedi": 7,
+    "sekiz": 8,
+    "dokuz": 9,
+    "on": 10,
 }
 
 
@@ -5040,10 +5583,147 @@ def _is_analysis_request(text: str) -> bool:
     normalized = _normalize_text(text)
     if _contains_any(normalized, _IMAGE_EDIT_TOKENS):
         return False
+    if _contains_any(normalized, _IMAGE_COMPARE_TOKENS):
+        return True
     return _contains_any(normalized, _ANALYSIS_TOKENS)
 
 
+def _is_image_request_without_caption(text: str) -> bool:
+    normalized = _normalize_text(text)
+    if _contains_any(normalized, _IMAGE_EDIT_TOKENS):
+        return True
+    if _contains_any(normalized, _ANALYSIS_TOKENS):
+        return True
+    if _contains_any(normalized, _IMAGE_COMPARE_TOKENS):
+        return True
+    if _looks_like_cross_image_edit(normalized):
+        return True
+    return False
+
+
+def _extract_image_count(text: str) -> int | None:
+    image_tokens = r"(?:image|photo|picture|foto|fotograf|resim|gorsel)\w*"
+    match = re.search(rf"\b(\d+)\s*(?:adet|tane)?\s*{image_tokens}\b", text)
+    if match:
+        return int(match.group(1))
+    for word, count in _CARDINAL_IMAGE_TOKENS.items():
+        if re.search(rf"\b{re.escape(word)}\s*(?:adet|tane)?\s*{image_tokens}\b", text):
+            return count
+    return None
+
+
+def _resolve_expected_image_count(text: str, default: int = 1) -> int:
+    normalized = _normalize_text(text or "")
+    count = _extract_image_count(normalized)
+    if count:
+        return min(count, _MAX_MULTI_IMAGE_COUNT)
+    indexes = _extract_image_reference_indexes(normalized)
+    if indexes:
+        max_index = max(indexes)
+        if max_index > 0:
+            return min(max_index, _MAX_MULTI_IMAGE_COUNT)
+    if _contains_any(normalized, _IMAGE_COMPARE_TOKENS):
+        return 2
+    return default
+
+
+def _format_pending_image_message(expected_count: int, seed_count: int) -> str:
+    if seed_count <= 0:
+        return f"Please send {expected_count} images."
+    remaining = expected_count - seed_count
+    if remaining == 1:
+        return "Please send 1 more image."
+    return f"Please send {remaining} more images."
+
+
+def _looks_like_cross_image_edit(text: str) -> bool:
+    normalized = _normalize_text(text or "")
+    if not _mentions_explicit_image_reference(normalized):
+        return False
+    if not _contains_any(normalized, _IMAGE_TRANSFER_TOKENS):
+        return False
+    indexes = _extract_image_reference_indexes(normalized)
+    if len(set(indexes)) >= 2:
+        return True
+    count = _extract_image_count(normalized)
+    if count and count >= 2:
+        return True
+    return False
+
+
+def _resolve_multi_image_references(
+    task: str,
+    session_context: dict | None,
+    *,
+    max_images: int,
+) -> tuple[list[str] | None, bool]:
+    images = _get_recent_images(session_context)
+    if len(images) < 2:
+        return None, False
+    normalized = _normalize_text(task)
+    indexes = _extract_image_reference_indexes(normalized)
+    if indexes:
+        selected: list[str] = []
+        seen = set()
+        for index in indexes:
+            item = _select_image_by_position(images, index)
+            if not item:
+                continue
+            path = item.get("path")
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            selected.append(str(path))
+        if len(selected) >= 2:
+            return selected[:max_images], False
+        if len(selected) == 1:
+            return None, False
+        return None, True
+    count = _extract_image_count(normalized)
+    if count and count >= 2:
+        if len(images) < count:
+            return None, True
+        count = min(count, max_images)
+        recent = images[-count:]
+        selected = [str(item.get("path")) for item in recent if item.get("path")]
+        if len(selected) >= 2:
+            return selected, False
+        return None, True
+    if _contains_any(normalized, _IMAGE_COMPARE_TOKENS) and len(images) >= 2:
+        recent = images[-2:]
+        first = recent[0].get("path")
+        second = recent[1].get("path")
+        if first and second:
+            return [str(first), str(second)], False
+        return None, True
+    return None, False
+
+
+async def _validate_images_for_gemini(
+    llm_client,
+    prompt_text: str,
+    image_paths: list[str],
+    mime_type: str | None,
+) -> str | None:
+    if not image_paths:
+        return "Please send the image you want to edit."
+    if len(image_paths) > _MAX_MULTI_IMAGE_COUNT:
+        return f"Please send up to {_MAX_MULTI_IMAGE_COUNT} images."
+    for path in image_paths:
+        error = await _validate_image_for_gemini(
+            llm_client,
+            prompt_text,
+            path,
+            mime_type,
+        )
+        if error:
+            return error
+    return None
+
+
 async def _is_analysis_request_with_llm(llm_client, text: str) -> bool:
+    if _contains_any(_normalize_text(text), _IMAGE_COMPARE_TOKENS):
+        return True
     if llm_client is not None and text.strip():
         intent = await _classify_image_request(llm_client, text)
         if intent == "ANALYZE":

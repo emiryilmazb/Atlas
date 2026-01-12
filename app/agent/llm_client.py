@@ -855,6 +855,33 @@ class GeminiImageClient:
             logger.warning("edit_image failed, falling back: %s", exc)
         return self._edit_image_via_content(prompt, image_path)
 
+    def edit_images(self, prompt: str, image_paths: list[str]) -> bytes | None:
+        if not prompt or not image_paths:
+            return None
+        from google.genai import types
+
+        if not getattr(self._client, "vertexai", False):
+            return self._edit_images_via_content(prompt, image_paths)
+        try:
+            reference_images = [
+                types.RawReferenceImage(
+                    reference_id=index + 1,
+                    reference_image=types.Image.from_file(location=path),
+                )
+                for index, path in enumerate(image_paths)
+            ]
+            response = self._client.models.edit_image(
+                model=self._model,
+                prompt=prompt,
+                reference_images=reference_images,
+            )
+            image_bytes = _extract_image_bytes(response)
+            if image_bytes:
+                return image_bytes
+        except Exception as exc:  # pragma: no cover - network/proxy errors
+            logger.warning("edit_images failed, falling back: %s", exc)
+        return self._edit_images_via_content(prompt, image_paths)
+
     def analyze_image(self, prompt: str, image_path: str) -> str:
         if not prompt or not image_path:
             return ""
@@ -870,6 +897,27 @@ class GeminiImageClient:
                 prompt,
                 types.Part.from_bytes(data=image_data, mime_type=mime_type),
             ],
+            config=config,
+        )
+        if getattr(response, "text", None):
+            return response.text
+        return ""
+
+    def analyze_images(self, prompt: str, image_paths: list[str]) -> str:
+        if not prompt or not image_paths:
+            return ""
+        from google.genai import types
+
+        parts = []
+        for path in image_paths:
+            with open(path, "rb") as handle:
+                image_data = handle.read()
+            mime_type = mimetypes.guess_type(path)[0] or "image/png"
+            parts.append(types.Part.from_bytes(data=image_data, mime_type=mime_type))
+        config = self.build_generate_config()
+        response = self._client.models.generate_content(
+            model=self._model,
+            contents=[prompt, *parts],
             config=config,
         )
         if getattr(response, "text", None):
@@ -953,6 +1001,25 @@ class GeminiImageClient:
                 prompt,
                 types.Part.from_bytes(data=image_data, mime_type=mime_type),
             ],
+            config=config,
+        )
+        return _extract_image_bytes(response)
+
+    def _edit_images_via_content(self, prompt: str, image_paths: list[str]) -> bytes | None:
+        from google.genai import types
+
+        parts = []
+        for path in image_paths:
+            with open(path, "rb") as handle:
+                image_data = handle.read()
+            mime_type = mimetypes.guess_type(path)[0] or "image/png"
+            parts.append(types.Part.from_bytes(data=image_data, mime_type=mime_type))
+        config = self.build_generate_config(
+            response_modalities=[types.Modality.IMAGE],
+        )
+        response = self._client.models.generate_content(
+            model=self._model,
+            contents=[prompt, *parts],
             config=config,
         )
         return _extract_image_bytes(response)
