@@ -12,6 +12,8 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
 class Settings:
     app_name: str = "Atlas"
     log_level: str = "INFO"
+    log_style: str = "pretty"
+    log_color: bool = True
     httpx_log_path_only: bool = False
     sqlite_db_path: str = ""
     memory_enabled: bool = True
@@ -88,14 +90,10 @@ def _env_int(name: str, default: int) -> int:
 def get_settings() -> Settings:
     load_dotenv()
     return Settings(
-        app_name=(
-            os.getenv("ATLAS_APP_NAME")
-            or os.getenv("APPLYWISE_APP_NAME", "Atlas")
-        ),
-        log_level=(
-            os.getenv("ATLAS_LOG_LEVEL")
-            or os.getenv("APPLYWISE_LOG_LEVEL", "INFO")
-        ),
+        app_name=os.getenv("ATLAS_APP_NAME", "Atlas"),
+        log_level=os.getenv("ATLAS_LOG_LEVEL", "INFO"),
+        log_style=os.getenv("ATLAS_LOG_STYLE", "pretty"),
+        log_color=_env_flag("ATLAS_LOG_COLOR", True),
         httpx_log_path_only=_env_flag("HTTPX_LOG_PATH_ONLY", False),
         sqlite_db_path=os.getenv("SQLITE_DB_PATH", ""),
         memory_enabled=_env_flag("MEMORY_ENABLED", True),

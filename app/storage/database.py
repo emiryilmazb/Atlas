@@ -12,12 +12,7 @@ from app.config import get_settings
 
 def _default_db_path() -> Path:
     root = Path(__file__).resolve().parents[2]
-    atlas_path = root / "data" / "atlas.db"
-    legacy_path = root / "data" / "applywise.db"
-    # Preserve existing data when upgrading project name.
-    if not atlas_path.exists() and legacy_path.exists():
-        return legacy_path
-    return atlas_path
+    return root / "data" / "atlas.db"
 
 
 def _utc_now() -> str:

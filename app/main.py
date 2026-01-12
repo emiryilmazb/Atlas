@@ -138,6 +138,7 @@ async def _shutdown_playwright(context: AgentContext) -> None:
 async def main() -> None:
     init_logging()
     logger = logging.getLogger(__name__)
+    logger.info("=== Atlas is online. Systems standing by. ===")
     context = AgentContext()
     settings = get_settings()
     db = get_database()
@@ -190,12 +191,28 @@ async def main() -> None:
             break
         context.complete()
         logger.info("Agent completed")
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        if task and hasattr(task, "uncancel"):
+            task.uncancel()
+        if not context.stop_requested:
+            context.request_stop(reason="shutdown")
+        logger.warning("Shutdown signal received. Cleaning up.")
+    except KeyboardInterrupt:
+        if not context.stop_requested:
+            context.request_stop(reason="keyboard_interrupt")
+        logger.warning("Keyboard interrupt received. Cleaning up.")
     finally:
+        logger.info("=== Atlas is going offline. Wrapping up. ===")
         await _shutdown_playwright(context)
         await application.updater.stop()
         await application.stop()
         await application.shutdown()
+        logger.info("=== Atlas is offline. Shutdown complete. ===")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
