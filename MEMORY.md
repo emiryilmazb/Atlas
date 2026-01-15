@@ -4,7 +4,7 @@ Atlas can store compact conversation summaries and retrieve relevant past contex
 
 ## How it works
 
-- Short-term context: the last 20 messages are loaded from SQLite and used as usual.
+- Short-term context: the last 20 messages are loaded from Postgres and used as usual.
 - Long-term memory: every N user messages (default 12), the bot summarizes recent turns and stores a memory item.
 - Retrieval: each new user message is embedded, scored against stored summaries, and the top-k items are injected into the prompt before the chat history.
 - Profile memory (lightweight): if the user explicitly states stable preferences (tone, name, formatting), a small profile JSON is updated and injected into the prompt.
@@ -36,7 +36,7 @@ ANONYMITY_DEFAULT_OFF=True
 
 ## Privacy
 
-- Summaries are stored in SQLite (see `data/atlas.db` by default).
+- Summaries are stored in Postgres via `DATABASE_URL` (or split fields in `.env`).
 - `anonim on` stops new writes; use `/forget <id>` to delete specific memory items.
 
 ## Disabling memory

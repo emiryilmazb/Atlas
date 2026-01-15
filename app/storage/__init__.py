@@ -1,1 +1,1 @@
-"""Storage utilities for SQLite-backed persistence."""
+"""Storage utilities for database-backed persistence."""

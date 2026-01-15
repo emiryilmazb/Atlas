@@ -1,6 +1,6 @@
 # Atlas
 
-Atlas is a local, Telegram-first AI agent that automates job applications, desktop workflows, and Google Workspace tasks using Gemini. It runs on your machine, keeps human approvals in the loop, and stores memory in SQLite so it can keep context between sessions.
+Atlas is a local, Telegram-first AI agent that automates job applications, desktop workflows, and Google Workspace tasks using Gemini. It runs on your machine, keeps human approvals in the loop, and stores memory in Postgres (Supabase) so it can keep context between sessions.
 
 ## What it can do
 
@@ -20,8 +20,8 @@ Atlas is a local, Telegram-first AI agent that automates job applications, deskt
 - `app/sites/`: site adapters (Kariyer, LinkedIn stub, external ATS).
 - `app/agent/`: Gemini clients, answer generation, routing, and safety.
 - `app/services/`: Gmail and Google Workspace integrations.
-- `app/storage/`: SQLite database and session persistence.
-- `data/`: default SQLite DB and OAuth tokens.
+- `app/storage/`: Postgres database and session persistence.
+- `data/`: OAuth tokens and runtime files.
 - `artifacts/`: generated/edited images and temporary files (created at runtime).
 
 ## Requirements
@@ -177,8 +177,33 @@ MEMORY_RETRIEVAL_TOP_K=5
 EMBEDDING_BACKEND=sentence_transformers
 EMBEDDING_MODEL_NAME=all-MiniLM-L6-v2
 ANONYMITY_DEFAULT_OFF=True
-SQLITE_DB_PATH=
+DATABASE_URL=
 ```
+`DATABASE_URL` is required for storage (or set `user/password/host/port/dbname` and it will be built automatically).
+
+## Database setup (Postgres/Supabase)
+
+Atlas uses Postgres only. You can provide a full connection string or split fields.
+
+Full URL:
+```ini
+DATABASE_URL=postgresql://user:password@host:5432/dbname?sslmode=require
+```
+
+Split fields (Atlas will build the URL):
+```ini
+user=
+password=
+host=
+port=5432
+dbname=postgres
+DB_SSLMODE=require
+```
+
+Supabase notes:
+- IPv6/direct: host `db.<project>.supabase.co`, user `postgres`, port `5432`.
+- IPv4: use the Session Pooler host `aws-<region>.pooler.supabase.com` and user format `postgres.<project>`.
+- If port `5432` is blocked, try transaction pooler on `6543`.
 
 Gmail polling (optional):
 ```ini
@@ -209,7 +234,7 @@ Examples:
 ## Job application flow notes
 
 - The Kariyer.net flow searches using a derived query from your CV profile and then fills visible form fields.
-- For better auto-answers, populate the CV profile tables in SQLite (`data/atlas.db`, tables prefixed with `cv_`).
+- For better auto-answers, populate the CV profile tables in the database (tables prefixed with `cv_`).
 - If a form asks about legal/work authorization or other high-risk fields, the agent will ask you to answer in Telegram.
 - `KARIYER_JOB_URL` exists in config but is not used by the current flow.
 
@@ -254,12 +279,24 @@ Examples:
 
 ## Data and storage
 
-- SQLite DB: `data/atlas.db` by default (override with `SQLITE_DB_PATH`).
-- Memory summaries and profile facts live in the SQLite database.
+- Database: Postgres via `DATABASE_URL` (Supabase or your own Postgres).
+- Memory summaries and profile facts live in Postgres.
 - OAuth tokens live in `data/` unless overridden.
 - Generated and edited images are saved under `artifacts/`.
 
 For memory details, see `MEMORY.md`.
+
+## SQLite -> Postgres migration
+
+1. Set `DATABASE_URL` (Supabase requires `?sslmode=require`).
+   - IPv4 network: use the Session Pooler host (`aws-<region>.pooler.supabase.com`) and the user
+     format `postgres.<project>`.
+2. If your SQLite file is not at `data/atlas.db`, set `SQLITE_DB_PATH` or pass `--sqlite-path`.
+3. Run the migration script from the repo root:
+   ```bash
+   python -m app.scripts.migrate_sqlite_to_postgres --truncate
+   ```
+4. Start the app; it will use Postgres. SQLite is only used as the migration source.
 
 ## Tests
 

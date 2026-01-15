@@ -1,5 +1,6 @@
 python-telegram-bot
 python-dotenv
+psycopg[binary]
 google-genai
 google-api-python-client
 google-auth-httplib2

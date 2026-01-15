@@ -2,21 +2,109 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
-import sqlite3
+import os
 import threading
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from app.config import get_settings
 
-
-def _default_db_path() -> Path:
-    root = Path(__file__).resolve().parents[2]
-    return root / "data" / "atlas.db"
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    psycopg = None
+    dict_row = None
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class _ConnectionAdapter:
+    def __init__(self, connection: Any, reconnect: callable | None = None) -> None:
+        self._connection = connection
+        self._reconnect = reconnect
+
+    def _prepare_query(self, query: str) -> str:
+        return query.replace("?", "%s")
+
+    def _is_closed(self) -> bool:
+        try:
+            return bool(self._connection.closed)
+        except Exception:
+            return False
+
+    def _ensure_connection(self) -> None:
+        if not self._is_closed():
+            return
+        if not self._reconnect:
+            raise RuntimeError("Database connection is closed.")
+        self._connection = self._reconnect()
+
+    def _should_reconnect(self, exc: Exception) -> bool:
+        if self._is_closed():
+            return True
+        if psycopg is None:
+            return False
+        if isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError)):
+            message = str(exc).lower()
+            if "connection is closed" in message:
+                return True
+            if "server closed the connection unexpectedly" in message:
+                return True
+        return False
+
+    def _execute_with_retry(self, method: str, *args):
+        self._ensure_connection()
+        try:
+            return getattr(self._connection, method)(*args)
+        except Exception as exc:
+            if self._should_reconnect(exc) and self._reconnect:
+                self._connection = self._reconnect()
+                return getattr(self._connection, method)(*args)
+            raise
+
+    def execute(self, query: str, params: Iterable[Any] | None = None):
+        return self._execute_with_retry(
+            "execute", self._prepare_query(query), params or ()
+        )
+
+    def executemany(self, query: str, params: Iterable[Iterable[Any]]):
+        def run():
+            if hasattr(self._connection, "executemany"):
+                return self._connection.executemany(self._prepare_query(query), params)
+            with self._connection.cursor() as cursor:
+                return cursor.executemany(self._prepare_query(query), params)
+
+        self._ensure_connection()
+        try:
+            return run()
+        except Exception as exc:
+            if self._should_reconnect(exc) and self._reconnect:
+                self._connection = self._reconnect()
+                return run()
+            raise
+
+    def executescript(self, script: str) -> None:
+        statements = [stmt.strip() for stmt in script.split(";") if stmt.strip()]
+        for statement in statements:
+            self._execute_with_retry("execute", statement)
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def __enter__(self) -> "_ConnectionAdapter":
+        self._ensure_connection()
+        return self
+
+    def __exit__(self, exc_type, exc, exc_tb) -> bool | None:
+        if self._is_closed():
+            return False
+        if exc_type:
+            self._connection.rollback()
+            return False
+        self._connection.commit()
+        return None
 
 
 @dataclass(frozen=True)
@@ -47,23 +135,46 @@ class MemoryItemRow:
 
 
 class DatabaseManager:
-    def __init__(self, db_path: Path) -> None:
-        self._db_path = db_path
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
-        self._lock = threading.Lock()
-        with self._connection:
-            self._connection.execute("PRAGMA foreign_keys = ON")
+    def __init__(self, database_url: str, *, connect_timeout: int | None = None) -> None:
+        if not database_url:
+            raise RuntimeError("DATABASE_URL is required for PostgreSQL support.")
+        if psycopg is None:
+            raise RuntimeError("psycopg is required for PostgreSQL support.")
+        if connect_timeout is None:
+            raw_timeout = os.getenv("DB_CONNECT_TIMEOUT") or os.getenv("PGCONNECT_TIMEOUT") or ""
+            try:
+                connect_timeout = int(raw_timeout)
+            except ValueError:
+                connect_timeout = None
+        self._lock = threading.RLock()
+        self._database_url = database_url
+        self._connect_timeout = connect_timeout
+        self._connection = _ConnectionAdapter(self._open_connection(), self._reconnect)
 
-    @property
-    def path(self) -> Path:
-        return self._db_path
+    def _open_connection(self) -> Any:
+        connect_kwargs: dict[str, Any] = {"row_factory": dict_row}
+        if self._connect_timeout:
+            connect_kwargs["connect_timeout"] = self._connect_timeout
+        connection = psycopg.connect(self._database_url, **connect_kwargs)
+        connection.execute("SET TIME ZONE 'UTC'")
+        connection.commit()
+        return connection
+
+    def _reconnect(self) -> Any:
+        with self._lock:
+            return self._open_connection()
 
     def initialize(self) -> None:
-        schema = """
+        schema = self._schema_postgres()
+        with self._lock, self._connection:
+            self._connection.executescript(schema)
+        self._ensure_message_columns()
+        self._ensure_memory_tables()
+
+    def _schema_postgres(self) -> str:
+        return """
         CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             user_id TEXT NOT NULL,
             role TEXT NOT NULL,
             content TEXT NOT NULL,
@@ -97,7 +208,7 @@ class DatabaseManager:
             FOREIGN KEY (user_id) REFERENCES sessions(user_id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS session_short_term_memory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             user_id TEXT NOT NULL,
             position INTEGER NOT NULL,
             message TEXT NOT NULL,
@@ -108,7 +219,7 @@ class DatabaseManager:
             ON session_short_term_memory(user_id, position);
 
         CREATE TABLE IF NOT EXISTS session_images (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             user_id TEXT NOT NULL,
             position INTEGER NOT NULL,
             image_path TEXT NOT NULL,
@@ -122,7 +233,7 @@ class DatabaseManager:
             ON session_images(user_id, position);
 
         CREATE TABLE IF NOT EXISTS personal_facts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             position INTEGER NOT NULL,
             intent TEXT,
             question TEXT,
@@ -133,7 +244,7 @@ class DatabaseManager:
         );
 
         CREATE TABLE IF NOT EXISTS answer_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             position INTEGER NOT NULL,
             intent TEXT,
             question TEXT,
@@ -150,14 +261,14 @@ class DatabaseManager:
             work_type TEXT
         );
         CREATE TABLE IF NOT EXISTS cv_skill (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             profile_id INTEGER NOT NULL,
             position INTEGER NOT NULL,
             skill TEXT NOT NULL,
             FOREIGN KEY (profile_id) REFERENCES cv_profile(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS cv_experience (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             profile_id INTEGER NOT NULL,
             position INTEGER NOT NULL,
             company TEXT,
@@ -166,28 +277,28 @@ class DatabaseManager:
             FOREIGN KEY (profile_id) REFERENCES cv_profile(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS cv_experience_technology (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            experience_id INTEGER NOT NULL,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            experience_id BIGINT NOT NULL,
             position INTEGER NOT NULL,
             technology TEXT NOT NULL,
             FOREIGN KEY (experience_id) REFERENCES cv_experience(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS cv_experience_responsibility (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            experience_id INTEGER NOT NULL,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            experience_id BIGINT NOT NULL,
             position INTEGER NOT NULL,
             responsibility TEXT NOT NULL,
             FOREIGN KEY (experience_id) REFERENCES cv_experience(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS cv_experience_achievement (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            experience_id INTEGER NOT NULL,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            experience_id BIGINT NOT NULL,
             position INTEGER NOT NULL,
             achievement TEXT NOT NULL,
             FOREIGN KEY (experience_id) REFERENCES cv_experience(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS cv_education (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             profile_id INTEGER NOT NULL,
             position INTEGER NOT NULL,
             institution TEXT,
@@ -198,7 +309,7 @@ class DatabaseManager:
             FOREIGN KEY (profile_id) REFERENCES cv_profile(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS cv_project (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             profile_id INTEGER NOT NULL,
             position INTEGER NOT NULL,
             name TEXT,
@@ -207,31 +318,27 @@ class DatabaseManager:
             FOREIGN KEY (profile_id) REFERENCES cv_profile(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS cv_project_technology (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id INTEGER NOT NULL,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            project_id BIGINT NOT NULL,
             position INTEGER NOT NULL,
             technology TEXT NOT NULL,
             FOREIGN KEY (project_id) REFERENCES cv_project(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS cv_project_description (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id INTEGER NOT NULL,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            project_id BIGINT NOT NULL,
             position INTEGER NOT NULL,
             description TEXT NOT NULL,
             FOREIGN KEY (project_id) REFERENCES cv_project(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS cv_preference_location (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             profile_id INTEGER NOT NULL,
             position INTEGER NOT NULL,
             location TEXT NOT NULL,
             FOREIGN KEY (profile_id) REFERENCES cv_profile(id) ON DELETE CASCADE
         );
         """
-        with self._lock, self._connection:
-            self._connection.executescript(schema)
-        self._ensure_message_columns()
-        self._ensure_memory_tables()
 
     def add_message(
         self,
@@ -247,7 +354,7 @@ class DatabaseManager:
     ) -> int:
         timestamp = timestamp or _utc_now()
         with self._lock, self._connection:
-            cursor = self._connection.execute(
+            return self._insert_and_get_id(
                 """
                 INSERT INTO messages (
                     user_id, role, content, timestamp, file_path, file_type,
@@ -267,7 +374,6 @@ class DatabaseManager:
                     source_chat_id,
                 ),
             )
-            return int(cursor.lastrowid)
 
     def get_recent_messages(self, user_id: str, limit: int) -> list[MessageRow]:
         rows = self._fetchall(
@@ -474,7 +580,7 @@ class DatabaseManager:
     ) -> int:
         created_at = _utc_now()
         with self._lock, self._connection:
-            cursor = self._connection.execute(
+            return self._insert_and_get_id(
                 """
                 INSERT INTO memory_items (
                     user_key, chat_id, kind, title, summary, tags,
@@ -494,7 +600,6 @@ class DatabaseManager:
                     created_at,
                 ),
             )
-            return int(cursor.lastrowid)
 
     def get_memory_items(self, user_key: str, limit: int = 500) -> list[MemoryItemRow]:
         if not user_key:
@@ -731,7 +836,7 @@ class DatabaseManager:
         with self._lock, self._connection:
             self._clear_cv_profile()
             self._connection.execute(
-                "INSERT OR REPLACE INTO cv_profile (id, summary, work_type) VALUES (1, ?, ?)",
+                "INSERT INTO cv_profile (id, summary, work_type) VALUES (1, ?, ?)",
                 (summary, work_type),
             )
             for position, skill in enumerate(skills):
@@ -743,7 +848,7 @@ class DatabaseManager:
                     (position, str(skill)),
                 )
             for position, exp in enumerate(experience):
-                cursor = self._connection.execute(
+                exp_id = self._insert_and_get_id(
                     """
                     INSERT INTO cv_experience (profile_id, position, company, role, duration)
                     VALUES (1, ?, ?, ?, ?)
@@ -755,7 +860,6 @@ class DatabaseManager:
                         exp.get("duration"),
                     ),
                 )
-                exp_id = int(cursor.lastrowid)
                 for index, item in enumerate(exp.get("technologies", []) or []):
                     self._connection.execute(
                         """
@@ -796,7 +900,7 @@ class DatabaseManager:
                     ),
                 )
             for position, project in enumerate(projects):
-                cursor = self._connection.execute(
+                project_id = self._insert_and_get_id(
                     """
                     INSERT INTO cv_project (profile_id, position, name, role, duration)
                     VALUES (1, ?, ?, ?, ?)
@@ -808,7 +912,6 @@ class DatabaseManager:
                         project.get("duration"),
                     ),
                 )
-                project_id = int(cursor.lastrowid)
                 for index, item in enumerate(project.get("technologies", []) or []):
                     self._connection.execute(
                         """
@@ -976,7 +1079,7 @@ class DatabaseManager:
         confirmed_at = confirmed_at or _utc_now()
         position = position if position is not None else self._next_position("personal_facts")
         with self._lock, self._connection:
-            cursor = self._connection.execute(
+            return self._insert_and_get_id(
                 """
                 INSERT INTO personal_facts
                     (position, intent, question, value, source, confirmed_at, country)
@@ -984,7 +1087,6 @@ class DatabaseManager:
                 """,
                 (position, intent, question, value, source, confirmed_at, country),
             )
-            return int(cursor.lastrowid)
 
     def load_personal_facts(self) -> list[dict[str, Any]]:
         rows = self._fetchall(
@@ -1011,7 +1113,7 @@ class DatabaseManager:
         submitted_at = submitted_at or _utc_now()
         position = position if position is not None else self._next_position("answer_history")
         with self._lock, self._connection:
-            cursor = self._connection.execute(
+            return self._insert_and_get_id(
                 """
                 INSERT INTO answer_history
                     (position, intent, question, answer, source, submitted_at, pending, category)
@@ -1028,7 +1130,6 @@ class DatabaseManager:
                     category,
                 ),
             )
-            return int(cursor.lastrowid)
 
     def load_answer_history(self) -> list[dict[str, Any]]:
         rows = self._fetchall(
@@ -1098,32 +1199,39 @@ class DatabaseManager:
             return 0
         return int(row["max_pos"]) + 1
 
-    def _fetchall(self, query: str, params: Iterable[Any] | None = None) -> list[sqlite3.Row]:
+    def _insert_and_get_id(self, query: str, params: Iterable[Any]) -> int:
+        cursor = self._connection.execute(f"{query} RETURNING id", params)
+        row = cursor.fetchone()
+        if row is None:
+            return 0
+        if isinstance(row, Mapping):
+            value = row.get("id")
+            if value is None and row:
+                value = next(iter(row.values()))
+            return int(value or 0)
+        return int(row[0])
+
+    def _fetchall(self, query: str, params: Iterable[Any] | None = None) -> list[Mapping[str, Any]]:
         with self._lock:
             cursor = self._connection.execute(query, params or ())
             return cursor.fetchall()
 
-    def _fetchone(self, query: str, params: Iterable[Any] | None = None) -> sqlite3.Row | None:
+    def _fetchone(self, query: str, params: Iterable[Any] | None = None) -> Mapping[str, Any] | None:
         with self._lock:
             cursor = self._connection.execute(query, params or ())
             return cursor.fetchone()
 
     def _ensure_message_columns(self) -> None:
-        columns = {row["name"] for row in self._fetchall("PRAGMA table_info(messages)")}
-        missing: list[tuple[str, str]] = []
-        if "source" not in columns:
-            missing.append(("source", "TEXT"))
-        if "source_message_id" not in columns:
-            missing.append(("source_message_id", "TEXT"))
-        if "source_chat_id" not in columns:
-            missing.append(("source_chat_id", "TEXT"))
-        if missing:
-            with self._lock, self._connection:
-                for name, column_type in missing:
-                    self._connection.execute(
-                        f"ALTER TABLE messages ADD COLUMN {name} {column_type}"
-                    )
         with self._lock, self._connection:
+            self._connection.execute(
+                "ALTER TABLE messages ADD COLUMN IF NOT EXISTS source TEXT"
+            )
+            self._connection.execute(
+                "ALTER TABLE messages ADD COLUMN IF NOT EXISTS source_message_id TEXT"
+            )
+            self._connection.execute(
+                "ALTER TABLE messages ADD COLUMN IF NOT EXISTS source_chat_id TEXT"
+            )
             self._connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_messages_source
@@ -1132,73 +1240,64 @@ class DatabaseManager:
             )
 
     def _ensure_memory_tables(self) -> None:
-        existing = {
-            row["name"]
-            for row in self._fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
-        }
         with self._lock, self._connection:
-            if "memory_items" not in existing:
-                self._connection.execute(
-                    """
-                    CREATE TABLE memory_items (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_key TEXT NOT NULL,
-                        chat_id TEXT,
-                        kind TEXT NOT NULL DEFAULT 'summary',
-                        title TEXT,
-                        summary TEXT NOT NULL,
-                        tags TEXT,
-                        embedding BLOB,
-                        importance REAL DEFAULT 0.5,
-                        created_at TEXT NOT NULL,
-                        last_used_at TEXT
-                    )
-                    """
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_items (
+                    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    user_key TEXT NOT NULL,
+                    chat_id TEXT,
+                    kind TEXT NOT NULL DEFAULT 'summary',
+                    title TEXT,
+                    summary TEXT NOT NULL,
+                    tags TEXT,
+                    embedding BYTEA,
+                    importance DOUBLE PRECISION DEFAULT 0.5,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT
                 )
-            if "user_profile" not in existing:
-                self._connection.execute(
-                    """
-                    CREATE TABLE user_profile (
-                        user_key TEXT PRIMARY KEY,
-                        profile_json TEXT,
-                        updated_at TEXT NOT NULL
-                    )
-                    """
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_profile (
+                    user_key TEXT PRIMARY KEY,
+                    profile_json TEXT,
+                    updated_at TEXT NOT NULL
                 )
-            if "user_settings" not in existing:
-                self._connection.execute(
-                    """
-                    CREATE TABLE user_settings (
-                        user_key TEXT PRIMARY KEY,
-                        anonymous_mode INTEGER NOT NULL DEFAULT 0,
-                        updated_at TEXT NOT NULL
-                    )
-                    """
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_key TEXT PRIMARY KEY,
+                    anonymous_mode INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
                 )
-            if "memory_events" not in existing:
-                self._connection.execute(
-                    """
-                    CREATE TABLE memory_events (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_key TEXT,
-                        event_type TEXT,
-                        payload TEXT,
-                        created_at TEXT NOT NULL
-                    )
-                    """
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_events (
+                    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    user_key TEXT,
+                    event_type TEXT,
+                    payload TEXT,
+                    created_at TEXT NOT NULL
                 )
-            if "gmail_notifications" not in existing:
-                self._connection.execute(
-                    """
-                    CREATE TABLE gmail_notifications (
-                        user_key TEXT NOT NULL,
-                        message_id TEXT NOT NULL,
-                        label TEXT,
-                        notified_at TEXT NOT NULL,
-                        PRIMARY KEY (user_key, message_id)
-                    )
-                    """
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gmail_notifications (
+                    user_key TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    label TEXT,
+                    notified_at TEXT NOT NULL,
+                    PRIMARY KEY (user_key, message_id)
                 )
+                """
+            )
             self._connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_memory_items_user_created
@@ -1219,7 +1318,9 @@ class DatabaseManager:
             )
 
     @staticmethod
-    def _group_rows(rows: list[sqlite3.Row], key_field: str, value_field: str) -> dict[int, list[str]]:
+    def _group_rows(
+        rows: list[Mapping[str, Any]], key_field: str, value_field: str
+    ) -> dict[int, list[str]]:
         grouped: dict[int, list[str]] = {}
         for row in rows:
             key = int(row[key_field])
@@ -1231,13 +1332,14 @@ _DB_INSTANCE: DatabaseManager | None = None
 _DB_LOCK = threading.Lock()
 
 
-def get_database(db_path: str | None = None) -> DatabaseManager:
+def get_database(database_url: str | None = None) -> DatabaseManager:
     global _DB_INSTANCE
     with _DB_LOCK:
         if _DB_INSTANCE is None:
             settings = get_settings()
-            path_value = db_path or getattr(settings, "sqlite_db_path", "") or ""
-            path = Path(path_value) if path_value else _default_db_path()
-            _DB_INSTANCE = DatabaseManager(path)
+            database_url = database_url or getattr(settings, "database_url", "") or ""
+            if not database_url:
+                raise RuntimeError("DATABASE_URL must be set to use PostgreSQL.")
+            _DB_INSTANCE = DatabaseManager(database_url=database_url)
             _DB_INSTANCE.initialize()
         return _DB_INSTANCE

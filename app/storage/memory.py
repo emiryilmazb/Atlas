@@ -27,7 +27,7 @@ def load_memory_context() -> MemoryContext:
     personal_facts = _normalize_personal_facts(db.load_personal_facts())
     past_answers = _normalize_answer_history(db.load_answer_history())
 
-    logger.info("Memory read: loading memory context from SQLite")
+    logger.info("Memory read: loading memory context from database")
     return MemoryContext(
         cv_profile=cv_profile,
         personal_facts=personal_facts,

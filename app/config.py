@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import os
+from urllib.parse import quote
 
 try:
     from dotenv import load_dotenv
@@ -15,7 +16,7 @@ class Settings:
     log_style: str = "pretty"
     log_color: bool = True
     httpx_log_path_only: bool = False
-    sqlite_db_path: str = ""
+    database_url: str = ""
     memory_enabled: bool = True
     memory_aggressive_inference: bool = True
     memory_summary_every_n_user_msg: int = 12
@@ -88,6 +89,33 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _normalize_database_url(url: str) -> str:
+    cleaned = (url or "").strip()
+    if cleaned.startswith("postgresql+psycopg2://"):
+        return "postgresql://" + cleaned[len("postgresql+psycopg2://") :]
+    return cleaned
+
+
+def _build_database_url() -> str:
+    direct = _normalize_database_url(os.getenv("DATABASE_URL", ""))
+    if direct:
+        return direct
+    user = os.getenv("DB_USER") or os.getenv("PGUSER") or os.getenv("user") or ""
+    password = os.getenv("DB_PASSWORD") or os.getenv("PGPASSWORD") or os.getenv("password") or ""
+    host = os.getenv("DB_HOST") or os.getenv("PGHOST") or os.getenv("host") or ""
+    port = os.getenv("DB_PORT") or os.getenv("PGPORT") or os.getenv("port") or ""
+    dbname = os.getenv("DB_NAME") or os.getenv("PGDATABASE") or os.getenv("dbname") or ""
+    sslmode = os.getenv("DB_SSLMODE") or os.getenv("PGSSLMODE") or "require"
+    if not all([user, password, host, port, dbname]):
+        return ""
+    user_enc = quote(user, safe="")
+    password_enc = quote(password, safe="")
+    return (
+        f"postgresql://{user_enc}:{password_enc}@{host}:{port}/{dbname}"
+        f"?sslmode={sslmode}"
+    )
+
+
 def get_settings() -> Settings:
     load_dotenv()
     return Settings(
@@ -96,7 +124,7 @@ def get_settings() -> Settings:
         log_style=os.getenv("ATLAS_LOG_STYLE", "pretty"),
         log_color=_env_flag("ATLAS_LOG_COLOR", True),
         httpx_log_path_only=_env_flag("HTTPX_LOG_PATH_ONLY", False),
-        sqlite_db_path=os.getenv("SQLITE_DB_PATH", ""),
+        database_url=_build_database_url(),
         memory_enabled=_env_flag("MEMORY_ENABLED", True),
         memory_aggressive_inference=_env_flag("MEMORY_AGGRESSIVE_INFERENCE", True),
         memory_summary_every_n_user_msg=_env_int("MEMORY_SUMMARY_EVERY_N_USER_MSG", 12),
